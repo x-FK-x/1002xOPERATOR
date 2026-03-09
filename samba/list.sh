@@ -7,7 +7,6 @@ awk '
 /^\[/{
     name=$0
     gsub(/\[|\]/,"",name)
-    # exclude common system blocks
     if(name!="global" && name!="homes" && name!="printers" && name!="print$")
         print name
 }
