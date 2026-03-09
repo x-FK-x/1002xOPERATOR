@@ -3,21 +3,14 @@
 BASE="/etc/1002xOPERATOR"
 SAMBA="$BASE/samba"
 
-# === Check required packages ===
-REQUIRED_PACKAGES=("samba" "smbclient")
-MISSING=()
-
-for PKG in "${REQUIRED_PACKAGES[@]}"; do
-    dpkg -s "$PKG" &>/dev/null || MISSING+=("$PKG")
-done
-
-if [ ${#MISSING[@]} -ne 0 ]; then
-    whiptail --title "Missing Packages" --yesno \
-    "The following packages are missing:\n\n${MISSING[*]}\n\nInstall them now?" 15 60
+# === Check required packages (only samba) ===
+if ! dpkg -s samba &>/dev/null; then
+    whiptail --title "Missing Package" --yesno \
+    "The package 'samba' is not installed.\n\nInstall it now?" 15 60
     if [ $? -eq 0 ]; then
-        sudo apt update && sudo apt install -y "${MISSING[@]}"
+        sudo apt update && sudo apt install -y samba
     else
-        whiptail --msgbox "Cannot proceed without required Samba packages." 10 50
+        whiptail --msgbox "Cannot proceed without Samba installed." 10 50
         exit 1
     fi
 fi
@@ -37,7 +30,7 @@ SHARES+=("EXIT" "Back")
 # === Show Whiptail menu ===
 CHOICE=$(whiptail \
 --title "1002xOPERATOR - Samba Manager" \
---menu "Select Samba share or action:" \
+--menu "Select a share or action:" \
 25 80 15 \
 "${SHARES[@]}" \
 3>&1 1>&2 2>&3)
@@ -61,7 +54,6 @@ EXIT)
     ;;
 
 *)
-    # Choose action: Edit path or Delete share
     ACTION=$(whiptail \
     --title "$CHOICE" \
     --menu "Action" \
