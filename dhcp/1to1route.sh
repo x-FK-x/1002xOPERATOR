@@ -107,7 +107,7 @@ while read -r line; do
     [[ -z "$GW" ]] && continue
 
     ip route replace "$DEST" via "$GW" dev "$IFACE"
-done
+done < "$CONFIG_FILE"
 EOF
 
 chmod +x "$APPLY_SCRIPT"
