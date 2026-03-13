@@ -1,6 +1,6 @@
 #!/bin/bash
 # ufw-webinterface.sh – 1002xOPERATOR UFW Web Dashboard
-# Port 8083 - Full interactive web interface
+# Port 8083 - Full interactive web interface with block/allow
 
 PORT="${1:-8083}"
 
@@ -73,14 +73,38 @@ handle_request() {
         local action=$(echo "$post_data" | grep -oP 'action=\K[^&]+' | sed 's/%2F/\//g')
         local port=$(echo "$post_data" | grep -oP 'port=\K[^&]+')
         local proto=$(echo "$post_data" | grep -oP 'protocol=\K[^&]+')
+        local rule_type=$(echo "$post_data" | grep -oP 'rule_type=\K[^&]+')
+        local ip=$(echo "$post_data" | grep -oP 'ip=\K[^&]+' | sed 's/%2F/\//g')
         local policy=$(echo "$post_data" | grep -oP 'policy=\K[^&]+')
         local level=$(echo "$post_data" | grep -oP 'level=\K[^&]+')
         
         case "$action" in
             add_rule)
-                if [[ -n "$port" && -n "$proto" ]]; then
-                    message="<div class='success'>✓ Rule added: $port/$proto</div>"
-                    sudo ufw allow "$port/$proto" 2>/dev/null
+                if [[ -n "$port" && -n "$proto" && -n "$rule_type" ]]; then
+                    if [[ "$rule_type" == "ip" && -n "$ip" ]]; then
+                        message="<div class='success'>✓ Rule added: $port/$proto from $ip ($rule_type)</div>"
+                        sudo ufw allow from "$ip" to any port "$port" proto "$proto" 2>/dev/null
+                    else
+                        message="<div class='success'>✓ Rule added: $port/$proto</div>"
+                        sudo ufw allow "$port/$proto" 2>/dev/null
+                    fi
+                fi
+                ;;
+            block_rule)
+                if [[ -n "$port" && -n "$proto" && -n "$rule_type" ]]; then
+                    if [[ "$rule_type" == "ip" && -n "$ip" ]]; then
+                        message="<div class='success'>✓ Rule blocked: $port/$proto from $ip</div>"
+                        sudo ufw deny from "$ip" to any port "$port" proto "$proto" 2>/dev/null
+                    else
+                        message="<div class='success'>✓ Rule blocked: $port/$proto</div>"
+                        sudo ufw deny "$port/$proto" 2>/dev/null
+                    fi
+                fi
+                ;;
+            block_ip)
+                if [[ -n "$ip" ]]; then
+                    message="<div class='success'>✓ IP blocked: $ip</div>"
+                    sudo ufw deny from "$ip" 2>/dev/null
                 fi
                 ;;
             set_policy)
@@ -100,16 +124,16 @@ handle_request() {
 
     # Get UFW data
     local ufw_status
-    ufw_status=$(ufw status 2>/dev/null | head -1 | awk '{print $2}')
+    ufw_status=$(sudo ufw status 2>/dev/null | head -1 | awk '{print $2}')
     
     local ufw_color
     [[ "$ufw_status" == "active" ]] && ufw_color="#00ff88" || ufw_color="#ff3860"
 
     local rule_count
-    rule_count=$(ufw status 2>/dev/null | tail -n +4 | grep -v "^--" | grep -v "^$" | wc -l)
+    rule_count=$(sudo ufw status 2>/dev/null | tail -n +4 | grep -v "^--" | grep -v "^$" | wc -l)
 
     local logging_level
-    logging_level=$(ufw logging 2>/dev/null | grep -oP 'level: \K\w+' || echo "medium")
+    logging_level=$(sudo ufw logging 2>/dev/null | grep -oP 'level: \K\w+' || echo "medium")
 
     local current_time
     current_time=$(date '+%Y-%m-%d %H:%M:%S')
@@ -164,7 +188,7 @@ handle_request() {
     background-size: 40px 40px;
     pointer-events: none;
   }
-  .container { position: relative; z-index: 1; width: 100%; max-width: 1000px; }
+  .container { position: relative; z-index: 1; width: 100%; max-width: 1200px; }
   .header {
     display: flex; justify-content: space-between; align-items: flex-start;
     margin-bottom: 40px;
@@ -200,10 +224,10 @@ handle_request() {
     0%,100%{ opacity:1; } 50%{ opacity:0.4; }
   }
   .grid {
-    display: grid; grid-template-columns: 1fr 1fr 1fr;
+    display: grid; grid-template-columns: 1fr 1fr 1fr 1fr;
     gap: 20px; margin-bottom: 40px;
   }
-  @media(max-width:1000px) { .grid { grid-template-columns: 1fr 1fr; } }
+  @media(max-width:1200px) { .grid { grid-template-columns: 1fr 1fr; } }
   @media(max-width:600px) { .grid { grid-template-columns: 1fr; } }
   .card {
     background: var(--surface);
@@ -268,6 +292,15 @@ handle_request() {
     background: var(--accent);
     color: var(--bg);
   }
+  .submit-btn.deny {
+    background: rgba(255,56,96,0.1);
+    border-color: var(--red);
+    color: var(--red);
+  }
+  .submit-btn.deny:hover {
+    background: var(--red);
+    color: var(--bg);
+  }
   .rule-item {
     display: flex; gap: 12px; align-items: center;
     padding: 8px; background: rgba(0,229,255,0.05);
@@ -313,6 +346,22 @@ handle_request() {
     font-size: 11px; color: var(--muted);
     margin-top: 40px;
   }
+  .tab-buttons { display: flex; gap: 10px; margin-bottom: 12px; }
+  .tab-btn {
+    flex: 1;
+    padding: 6px;
+    border: 1px solid var(--border);
+    background: rgba(0,229,255,0.05);
+    color: var(--muted);
+    cursor: pointer;
+    border-radius: 4px;
+    font-size: 10px;
+  }
+  .tab-btn.active {
+    background: rgba(0,229,255,0.2);
+    color: var(--accent);
+    border-color: var(--accent);
+  }
 </style>
 </head>
 <body>
@@ -348,9 +397,10 @@ handle_request() {
     </div>
 
     <div class="card">
-      <div class="card-title">Add Rule</div>
+      <div class="card-title">Allow Port</div>
       <form method="POST">
         <input type="hidden" name="action" value="add_rule">
+        <input type="hidden" name="rule_type" value="port">
         <div class="form-group">
           <label>Port</label>
           <input type="number" name="port" min="1" max="65535" required>
@@ -362,10 +412,44 @@ handle_request() {
             <option value="udp">UDP</option>
           </select>
         </div>
-        <button class="submit-btn" type="submit">✓ Add</button>
+        <button class="submit-btn" type="submit">✓ Allow</button>
       </form>
     </div>
 
+    <div class="card">
+      <div class="card-title">Block Port</div>
+      <form method="POST">
+        <input type="hidden" name="action" value="block_rule">
+        <input type="hidden" name="rule_type" value="port">
+        <div class="form-group">
+          <label>Port</label>
+          <input type="number" name="port" min="1" max="65535" required>
+        </div>
+        <div class="form-group">
+          <label>Protocol</label>
+          <select name="protocol" required>
+            <option value="tcp">TCP</option>
+            <option value="udp">UDP</option>
+          </select>
+        </div>
+        <button class="submit-btn deny" type="submit">✗ Block</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Block IP</div>
+      <form method="POST">
+        <input type="hidden" name="action" value="block_ip">
+        <div class="form-group">
+          <label>IP Address</label>
+          <input type="text" name="ip" placeholder="192.168.1.1" required>
+        </div>
+        <button class="submit-btn deny" type="submit">✗ Block IP</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="grid" style="grid-template-columns: 1fr 1fr;">
     <div class="card">
       <div class="card-title">Settings</div>
       <form method="POST">
@@ -394,11 +478,11 @@ handle_request() {
         <button class="submit-btn" type="submit">✓ Set</button>
       </form>
     </div>
-  </div>
 
-  <div class="card">
-    <div class="card-title">Recent Rules (Last 5)</div>
-    $recent_rules_html
+    <div class="card">
+      <div class="card-title">Recent Rules (Last 5)</div>
+      $recent_rules_html
+    </div>
   </div>
 
   <a href="http://$HOST_IP:8080" class="back-btn">← Back to Portal</a>
