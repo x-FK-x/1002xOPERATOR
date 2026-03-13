@@ -1,13 +1,9 @@
 #!/bin/bash
 
-# UFW Rule Manager - Delete rule
-# Similar to samba/delete.sh
+BASE="/etc/1002xOPERATOR/ufw/settings"
+RULES_FILE="$BASE/ufw-rules.conf"
 
-UFW_CONFIG="/etc/1002xOPERATOR/ufw/settings"
-RULES_FILE="$UFW_CONFIG/ufw-rules.conf"
-BASE="$UFW_CONFIG"
-
-mkdir -p "$UFW_CONFIG"
+mkdir -p "$BASE"
 
 # Check if whiptail is installed
 if ! command -v whiptail &>/dev/null; then
@@ -15,48 +11,39 @@ if ! command -v whiptail &>/dev/null; then
     exit 1
 fi
 
-# Check if rules file exists and has content
-if [[ ! -f "$RULES_FILE" || ! -s "$RULES_FILE" ]]; then
-    whiptail --msgbox "No firewall rules to delete." 8 50
+# Get active UFW rules
+RULES=()
+INDEX=1
+while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    # Skip header and separator lines
+    [[ "$line" =~ ^To || "$line" =~ ^-- || "$line" =~ ^Status ]] && continue
+    
+    RULES+=("$INDEX" "$line")
+    INDEX=$((INDEX+1))
+done < <(sudo ufw status 2>/dev/null)
+
+if [[ ${#RULES[@]} -eq 0 ]]; then
+    whiptail --msgbox "No active UFW rules to delete." 8 50
     exit 0
 fi
 
-# Build menu from rules file
-RULES=()
-INDEX=1
-while read -r line; do
-    [[ -z "$line" ]] && continue
-    RULES+=("$INDEX" "$line")
-    INDEX=$((INDEX+1))
-done < "$RULES_FILE"
-
 # Select rule to delete
-SELECTED=$(whiptail --title "Delete Firewall Rule" --menu "Select rule to delete:" 20 70 10 "${RULES[@]}" 3>&1 1>&2 2>&3)
+SELECTED=$(whiptail --title "Delete UFW Rule" --menu "Select rule to delete:" 20 70 10 "${RULES[@]}" 3>&1 1>&2 2>&3)
 [[ -z "$SELECTED" ]] && exit
 
 # Get the rule
-DEL_LINE=$(sed -n "${SELECTED}p" "$RULES_FILE")
-IFS=' ' read -r PORT PROTO DIR SRC DST ACTION <<< "$DEL_LINE"
+DEL_LINE="${RULES[$((SELECTED*2-1))]}"
 
 # Confirmation
 whiptail --yesno "Delete rule:\n\n$DEL_LINE" 10 60
 [ $? -ne 0 ] && exit
 
-# Remove from config
-sed -i "${SELECTED}d" "$RULES_FILE"
+# Parse and delete
+local port=$(echo "$DEL_LINE" | awk '{print $1}')
+local action=$(echo "$DEL_LINE" | awk '{print $2}')
 
-# Remove from UFW
-if [ "$PROTO" = "both" ]; then
-    sudo ufw delete $ACTION $PORT/tcp 2>/dev/null
-    sudo ufw delete $ACTION $PORT/udp 2>/dev/null
-else
-    sudo ufw delete $ACTION $PORT/$PROTO 2>/dev/null
-fi
+# Remove from UFW (try both allow and deny)
+sudo ufw delete allow "$port" 2>/dev/null || sudo ufw delete deny "$port" 2>/dev/null
 
-# Log action
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Deleted rule: $DEL_LINE" >> "$UFW_CONFIG/ufw-actions.log"
-
-whiptail --msgbox "Firewall rule deleted:\n\n$DEL_LINE" 10 60
-
-# Reload firewall
-"$BASE/reload.sh"
+whiptail --msgbox "Rule deleted:\n\n$DEL_LINE" 10 60
