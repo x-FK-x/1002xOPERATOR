@@ -1,6 +1,6 @@
 #!/bin/bash
 # portal.sh – 1002xOPERATOR Portal Startseite
-# Port 8080
+# Port 8079
 
 PORT="${1:-8080}"
 
@@ -17,42 +17,47 @@ handle_request() {
     done
 
     # Detect own IP
-    local HOST_IP
+    local HOST_IP LAN_IF DHCP_INSTALLED=0
     LAN_IF=$(grep -E '^INTERFACESv4=' /etc/default/isc-dhcp-server 2>/dev/null | cut -d'"' -f2)
+    [[ -n "$LAN_IF" ]] && DHCP_INSTALLED=1
     HOST_IP=$(ip -4 addr show dev "$LAN_IF" 2>/dev/null | awk '/inet/ {print $2}' | cut -d/ -f1 | head -n1)
+    [[ -z "$HOST_IP" ]] && HOST_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {print $7}' | head -n1)
     [[ -z "$HOST_IP" ]] && HOST_IP=$(hostname -I | awk '{print $1}')
 
     # Get live status
-    local wan_status samba_status dhcp_status ufw_status
+    local wan_status samba_status dhcp_status
     wan_status=$(systemctl is-active wan-failover 2>/dev/null)
     samba_status=$(systemctl is-active smbd 2>/dev/null)
     dhcp_status=$(systemctl is-active isc-dhcp-server 2>/dev/null)
-    ufw_status=$(sudo ufw status 2>/dev/null | head -1 | awk '{print $2}')
 
-    local wan_color samba_color dhcp_color ufw_color
+    local wan_color samba_color dhcp_color
     [[ "$wan_status"   == "active" ]] && wan_color="#00ff88"   || wan_color="#ff3860"
     [[ "$samba_status" == "active" ]] && samba_color="#00ff88" || samba_color="#ff3860"
     [[ "$dhcp_status"  == "active" ]] && dhcp_color="#00ff88"  || dhcp_color="#ff3860"
-    [[ "$ufw_status"   == "active" ]] && ufw_color="#00ff88"   || ufw_color="#ff3860"
 
     # WAN interfaces quick status
     local wan_ifaces=""
     local priority_file="/etc/1002xOPERATOR/dhcp/settings/wan-priority.list"
     local state_file="/etc/1002xOPERATOR/dhcp/settings/wan-failover.state"
+    local iface_list=""
     if [[ -f "$priority_file" ]]; then
-        local wan_list
-        wan_list=$(tail -n1 "$priority_file")
-        for iface in $wan_list; do
-            local ip state suppressed dot_color
-            ip=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet/ {print $2}' | head -n1)
-            state=$(cat /sys/class/net/$iface/operstate 2>/dev/null || echo "?")
-            grep -q "^SUPPRESSED $iface " "$state_file" 2>/dev/null && suppressed=1 || suppressed=0
-            if [[ "$suppressed" -eq 1 ]]; then dot_color="#ff3860"
-            elif [[ "$state" == "up" ]]; then dot_color="#00ff88"
-            else dot_color="#ff3860"; fi
-            wan_ifaces+="<div class='iface-pill'><span class='dot' style='background:$dot_color'></span><span class='iface-name'>$iface</span><span class='iface-ip'>${ip:-no ip}</span></div>"
-        done
+        iface_list=$(tail -n1 "$priority_file")
+    else
+        # No priority file – show all interfaces with IPs except loopback
+        iface_list=$(ip -o -4 addr show | awk '{print $2}' | grep -v '^lo$' | tr '
+' ' ')
     fi
+    for iface in $iface_list; do
+        local ip state suppressed dot_color label
+        ip=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet/ {print $2}' | head -n1)
+        state=$(cat /sys/class/net/$iface/operstate 2>/dev/null || echo "?")
+        grep -q "^SUPPRESSED $iface " "$state_file" 2>/dev/null && suppressed=1 || suppressed=0
+        [[ "$iface" == "$LAN_IF" ]] && label="LAN" || label="WAN"
+        if [[ "$suppressed" -eq 1 ]]; then dot_color="#ff3860"
+        elif [[ "$state" == "up" ]]; then dot_color="#00ff88"
+        else dot_color="#ff3860"; fi
+        wan_ifaces+="<div class='iface-pill'><span class='dot' style='background:$dot_color'></span><span class='iface-name'>$iface</span><span class='iface-ip'>${ip:-no ip}</span><span class='iface-ip' style='color:#64748b;margin-left:4px'>[$label]</span></div>"
+    done
 
     printf "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n"
     cat <<HTML
@@ -148,8 +153,7 @@ handle_request() {
   .dot { width: 7px; height: 7px; border-radius: 50%; }
   .iface-name { color: var(--accent); font-weight: 600; }
   .iface-ip { color: var(--muted); }
-  .modules { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; }
-  @media(max-width:900px) { .modules { grid-template-columns: 1fr 1fr; } }
+  .modules { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
   @media(max-width:600px) { .modules { grid-template-columns: 1fr; } }
   .module {
     background: var(--surface);
@@ -215,14 +219,11 @@ handle_request() {
       <div class="status-dot" style="background:$samba_color"></div>
       smbd: $samba_status
     </div>
-    <div class="status-item">
-      <div class="status-dot" style="background:$dhcp_color"></div>
+$(if [[ "$DHCP_INSTALLED" -eq 1 ]]; then echo "
+    <div class=\"status-item\">
+      <div class=\"status-dot\" style=\"background:$dhcp_color\"></div>
       isc-dhcp: $dhcp_status
-    </div>
-    <div class="status-item">
-      <div class="status-dot" style="background:$ufw_color"></div>
-      ufw: $ufw_status
-    </div>
+    </div>"; fi)
   </div>
 
   <div class="iface-pills">
@@ -230,20 +231,22 @@ handle_request() {
   </div>
 
   <div class="modules">
-    <a href="http://$HOST_IP:8081" class="module" style="--module-color: #00e5ff">
-      <span class="module-port">:8081</span>
-      <span class="module-icon">⬡</span>
-      <div class="module-title">DHCP</div>
-      <div class="module-desc">WAN Failover, Static Routes, DHCP Reservations, DNS</div>
-      <div class="module-tags">
-        <span class="tag">WAN</span>
-        <span class="tag">Routing</span>
-        <span class="tag">DNS</span>
+$(if [[ "$DHCP_INSTALLED" -eq 1 ]]; then echo "
+    <a href=\"http://$HOST_IP:8081\" class=\"module\" style=\"--module-color: #00e5ff\">
+      <span class=\"module-port\">:8081</span>
+      <span class=\"module-icon\">⬡</span>
+      <div class=\"module-title\">DHCP</div>
+      <div class=\"module-desc\">WAN Failover, Static Routes, DHCP Reservations, DNS Settings</div>
+      <div class=\"module-tags\">
+        <span class=\"tag\">WAN</span>
+        <span class=\"tag\">Routing</span>
+        <span class=\"tag\">DHCP</span>
+        <span class=\"tag\">DNS</span>
       </div>
-    </a>
+    </a>"; fi)
 
     <a href="http://$HOST_IP:8082" class="module" style="--module-color: #ff6b35">
-      <span class="module-port">:8082</span>
+      <span class="module-port">:8081</span>
       <span class="module-icon">⬢</span>
       <div class="module-title">Samba</div>
       <div class="module-desc">Manage, add, edit and delete file shares</div>
@@ -251,18 +254,6 @@ handle_request() {
         <span class="tag">SMB</span>
         <span class="tag">Shares</span>
         <span class="tag">Files</span>
-      </div>
-    </a>
-
-    <a href="http://$HOST_IP:8083" class="module" style="--module-color: #00ff88">
-      <span class="module-port">:8083</span>
-      <span class="module-icon">🛡️</span>
-      <div class="module-title">UFW</div>
-      <div class="module-desc">Firewall rules, policies, logging and diagnostics</div>
-      <div class="module-tags">
-        <span class="tag">Security</span>
-        <span class="tag">Firewall</span>
-        <span class="tag">Rules</span>
       </div>
     </a>
   </div>
@@ -284,7 +275,5 @@ mkfifo "$FIFO"
 trap "rm -f '$FIFO'" EXIT
 
 while true; do
-    handle_request < "$FIFO" | nc -q 1 -l -p "$PORT" > "$FIFO" 2>/dev/null || \
-    handle_request < "$FIFO" | nc -l -p "$PORT" > "$FIFO" 2>/dev/null || \
-    handle_request < "$FIFO" | nc -l "$PORT" > "$FIFO" 2>/dev/null
+    handle_request < "$FIFO" | nc -q 1 -l -p "$PORT" > "$FIFO" 2>/dev/null ||     handle_request < "$FIFO" | nc -l -p "$PORT" > "$FIFO" 2>/dev/null ||     handle_request < "$FIFO" | nc -l "$PORT" > "$FIFO" 2>/dev/null
 done
