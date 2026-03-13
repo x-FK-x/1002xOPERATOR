@@ -14,9 +14,27 @@ PING_TARGETS=("8.8.8.8" "1.1.1.1" "9.9.9.9")
 PING_COUNT=3
 PING_TIMEOUT=2
 
-log() { echo "[INFO] $1"; }
+log()  { echo "[INFO] $1"; }
 warn() { echo "[WARN] $1"; }
-ask() { read -rp "[QUESTION] $1 [y/N]: " reply; [[ "$reply" =~ ^[Yy]$ ]]; }
+ask()  { read -rp "[QUESTION] $1 [y/N]: " reply; [[ "$reply" =~ ^[Yy]$ ]]; }
+
+# -------------------------------------------------
+# CLEANUP – reset all previous configuration
+# -------------------------------------------------
+log "Cleaning up previous configuration..."
+
+# Stop and disable failover daemon
+systemctl stop wan-failover 2>/dev/null || true
+systemctl disable wan-failover 2>/dev/null || true
+rm -f /etc/systemd/system/wan-failover.service
+systemctl daemon-reload 2>/dev/null || true
+
+# Remove generated settings files
+rm -f "$FOLDERSETTINGS/wan-priority.list"
+rm -f "$FOLDERSETTINGS/wan-failover.state"
+rm -f "$FOLDERSETTINGS/dhcp-routes.sh"
+
+log "Cleanup complete."
 
 log "Detecting network interfaces..."
 mapfile -t INTERFACES < <(ip -o link show | awk -F': ' '{print $2}' | grep -v lo)
@@ -99,10 +117,14 @@ for iface in "${VALID_IFACES[@]}"; do
     ip link show "$iface" | grep -q "state UP" || { log_r "$iface DOWN, skipping."; continue; }
     GW=$(ip route show dev "$iface" | awk '/default/ {print $3}' | head -n1)
     if [[ -z "$GW" ]]; then
+        # Try DHCP lease file for real gateway
         IP_ADDR=$(ip -4 addr show dev "$iface" | awk '/inet/ {print $2}' | cut -d/ -f1 | head -n1)
-        [[ -n "$IP_ADDR" ]] && GW="${IP_ADDR%.*}.1"
+        # Try NetworkManager
+        GW=$(nmcli -g IP4.GATEWAY device show "$iface" 2>/dev/null | head -n1)
+        # Try reading from ip route table (any route, not just default)
+        [[ -z "$GW" ]] && GW=$(ip route show dev "$iface" | awk '/via/ {print $3}' | head -n1)
     fi
-    [[ -z "$GW" ]] && log_r "No gateway for $iface." && continue
+    [[ -z "$GW" ]] && log_r "No gateway found for $iface – skipping (no .1 fallback to avoid wrong gateway)." && continue
     # Remove ALL default routes for this interface (DHCP proto or any duplicate)
     while IFS= read -r route; do
         via=$(echo "$route" | awk '{print $3}')
@@ -154,7 +176,8 @@ check_wan() {
     gw=$(ip route show dev "$iface" | awk '/default/ {print $3}' | head -n1)
     # If no live route found, check saved state (interface may be suppressed)
     [[ -z "$gw" ]] && gw=$(grep "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null | awk '{print $3}' | head -n1)
-    [[ -z "$gw" ]] && gw="${ip%.*}.1"
+    # No .1 fallback – wrong gateway is worse than no check
+    [[ -z "$gw" ]] && { log_fo "[$iface] No gateway found, skipping check"; return 1; }
     ping -c 1 -W "$PING_TIMEOUT" -I "$iface" "$gw" &>/dev/null || { log_fo "[$iface] Gateway $gw unreachable"; return 1; }
     local ok=0
     for target in "${PING_TARGETS[@]}"; do
@@ -192,7 +215,8 @@ restore_interface() {
     [[ -n "$live_gw" ]] && gw="$live_gw"
     ip route replace default via "$gw" dev "$iface" metric "$metric" 2>/dev/null || true
     log_fo "RESTORED: Re-added default route for $iface via $gw metric $metric"
-    grep -v "^SUPPRESSED $iface " "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+    grep -v "^SUPPRESSED $iface " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
+    mv "${STATE_FILE}.tmp" "$STATE_FILE"
 }
 
 suspend_static_routes() {
@@ -231,7 +255,9 @@ touch "$STATE_FILE"
 
 # Run route fixer on startup to set correct metrics and remove DHCP duplicates
 DHCP_ROUTES_SCRIPT="/etc/1002xOPERATOR/dhcp/settings/dhcp-routes.sh"
+SOLO_ROUTES_SCRIPT="/etc/1002xOPERATOR/dhcp/settings/soloroute.sh"
 [[ -x "$DHCP_ROUTES_SCRIPT" ]] && bash "$DHCP_ROUTES_SCRIPT"
+[[ -x "$SOLO_ROUTES_SCRIPT" ]] && bash "$SOLO_ROUTES_SCRIPT"
 
 while true; do
     if [[ ! -f "$PRIORITY_FILE" ]]; then log_fo "No priority file found, waiting..."; sleep 30; continue; fi
@@ -257,6 +283,7 @@ while true; do
     done
     # Run route fixer every loop to clean up DHCP-injected duplicate routes
     [[ -x "$DHCP_ROUTES_SCRIPT" ]] && bash "$DHCP_ROUTES_SCRIPT"
+    [[ -x "$SOLO_ROUTES_SCRIPT" ]] && bash "$SOLO_ROUTES_SCRIPT"
     sleep 30
 done
 FAILEOF
