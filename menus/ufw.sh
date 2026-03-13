@@ -16,15 +16,16 @@ fi
 declare -A SCRIPTS
 SCRIPTS["check.sh"]="Show UFW status and diagnostics"
 SCRIPTS["list.sh"]="List all firewall rules"
-SCRIPTS["add.sh"]="Add new firewall rule"
-SCRIPTS["edit.sh"]="Edit existing rule"
-SCRIPTS["delete.sh"]="Delete firewall rule"
-SCRIPTS["policy.sh"]="Set default policies (DENY/ALLOW)"
-SCRIPTS["logging.sh"]="Configure logging settings"
-SCRIPTS["reload.sh"]="Reload UFW configuration"
+SCRIPTS["add.sh"]="Allow - Add and allow new rule"
+SCRIPTS["block.sh"]="Block - Block port or IP address"
+SCRIPTS["delete.sh"]="Delete - Remove firewall rule"
+SCRIPTS["edit.sh"]="Edit - Modify existing rule"
+SCRIPTS["policy.sh"]="Policies - Set default incoming/outgoing"
+SCRIPTS["logging.sh"]="Logging - Configure logging settings"
+SCRIPTS["reload.sh"]="Reload - Reload UFW configuration"
 
 # Menüoptionen in gewünschter Reihenfolge
-MENU_ORDER=("check.sh" "list.sh" "add.sh" "edit.sh" "delete.sh" "policy.sh" "logging.sh" "reload.sh")
+MENU_ORDER=("check.sh" "list.sh" "add.sh" "block.sh" "delete.sh" "edit.sh" "policy.sh" "logging.sh" "reload.sh")
 
 # Build menu options
 MENU_OPTIONS=()
@@ -34,7 +35,7 @@ done
 
 # Show Whiptail menu
 CHOICE=$(whiptail --title "1002xOPERATOR UFW Firewall" \
-    --menu "Select an action:" 22 80 10 \
+    --menu "Select an action:" 24 80 11 \
     "${MENU_OPTIONS[@]}" 3>&1 1>&2 2>&3)
 
 # Execute the selected script
