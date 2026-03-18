@@ -29,10 +29,9 @@ systemctl disable wan-failover 2>/dev/null || true
 rm -f /etc/systemd/system/wan-failover.service
 systemctl daemon-reload 2>/dev/null || true
 
-# Remove generated settings files
-rm -f "$FOLDERSETTINGS/wan-priority.list"
-rm -f "$FOLDERSETTINGS/wan-failover.state"
+# Remove generated scripts so they get regenerated fresh
 rm -f "$FOLDERSETTINGS/dhcp-routes.sh"
+rm -f "$FOLDERSETTINGS/wan-failover.sh"
 
 log "Cleanup complete."
 
@@ -112,9 +111,12 @@ for entry in "${WAN_IFACES[@]}"; do
 done
 [[ ${#VALID_IFACES[@]} -eq 0 ]] && log_r "No valid interfaces." && exit 0
 log_r "Processing: ${VALID_IFACES[*]}"
+STATE_FILE="/etc/1002xOPERATOR/dhcp/settings/wan-failover.state"
 METRIC=100
 for iface in "${VALID_IFACES[@]}"; do
     ip link show "$iface" | grep -q "state UP" || { log_r "$iface DOWN, skipping."; continue; }
+    # Skip suppressed interfaces – failover daemon manages their routes
+    grep -q "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null && { log_r "$iface suppressed, skipping route fix."; METRIC=$((METRIC + 100)); continue; }
     GW=$(ip route show dev "$iface" | awk '/default/ {print $3}' | head -n1)
     if [[ -z "$GW" ]]; then
         # Try DHCP lease file for real gateway
