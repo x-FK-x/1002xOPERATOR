@@ -243,7 +243,7 @@ page_reservations() {
 <form method='POST' action='/reservations/add'><div class='form-row'>
 <div class='form-group'><label>MAC</label><input type='text' name='mac' placeholder='aa:bb:cc:dd:ee:ff'></div>
 <div class='form-group'><label>IP</label><input type='text' name='ip' placeholder='10.2.0.100'></div>
-<div class='form-group'><label>Hostname</label><input type='text' name='host' placeholder='mein-geraet'></div>
+<div class='form-group'><label>Hostname</label><input type='text' name='host' placeholder='my-device'></div>
 <button class='btn btn-primary' type='submit'>+ Add</button>
 </div></form></div>"
     html_page "Reservationen" "$body"
