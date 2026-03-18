@@ -247,7 +247,11 @@ restore_static_routes() {
             log_fo "STATIC-ROUTE RESTORED: $dest via $iface ($live_gw)" || \
             log_fo "STATIC-ROUTE RESTORE FAILED: $dest via $iface ($live_gw)"
     done < "$SUSPENDED_ROUTES_FILE"
-    printf '%s\n' "${remaining[@]}" > "$SUSPENDED_ROUTES_FILE"
+    if [[ ${#remaining[@]} -gt 0 ]]; then
+        printf '%s\n' "${remaining[@]}" > "$SUSPENDED_ROUTES_FILE"
+    else
+        truncate -s 0 "$SUSPENDED_ROUTES_FILE"
+    fi
 }
 
 log_fo "=== WAN Failover daemon started ==="
