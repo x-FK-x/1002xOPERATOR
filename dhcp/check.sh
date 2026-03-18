@@ -253,6 +253,37 @@ restore_static_routes() {
 log_fo "=== WAN Failover daemon started ==="
 touch "$STATE_FILE"
 
+# Ensure NAT & FORWARD iptables rules are in place
+ensure_iptables() {
+    local priority_file="$PRIORITY_FILE"
+    local lan_if
+    lan_if=$(grep -E '^INTERFACESv4=' /etc/default/isc-dhcp-server 2>/dev/null | cut -d'"' -f2)
+    [[ -z "$lan_if" ]] && return
+    local wan_list
+    [[ -f "$priority_file" ]] && wan_list=$(tail -n1 "$priority_file") || return
+    local changed=0
+    for iface in $wan_list; do
+        ip link show "$iface" &>/dev/null || continue
+        if ! iptables -t nat -C POSTROUTING -o "$iface" -j MASQUERADE &>/dev/null; then
+            iptables -t nat -A POSTROUTING -o "$iface" -j MASQUERADE
+            log_fo "[iptables] RESTORED: NAT MASQUERADE rule for $iface"
+            changed=1
+        fi
+        if ! iptables -C FORWARD -i "$lan_if" -o "$iface" -j ACCEPT &>/dev/null; then
+            iptables -A FORWARD -i "$lan_if" -o "$iface" -j ACCEPT
+            log_fo "[iptables] RESTORED: FORWARD $lan_if -> $iface"
+            changed=1
+        fi
+        if ! iptables -C FORWARD -i "$iface" -o "$lan_if" -m state --state RELATED,ESTABLISHED -j ACCEPT &>/dev/null; then
+            iptables -A FORWARD -i "$iface" -o "$lan_if" -m state --state RELATED,ESTABLISHED -j ACCEPT
+            log_fo "[iptables] RESTORED: FORWARD $iface -> $lan_if (RELATED,ESTABLISHED)"
+            changed=1
+        fi
+    done
+    [[ "$changed" -eq 0 ]] && log_fo "[iptables] All rules OK"
+}
+ensure_iptables
+
 # Run route fixer on startup to set correct metrics and remove DHCP duplicates
 DHCP_ROUTES_SCRIPT="/etc/1002xOPERATOR/dhcp/settings/dhcp-routes.sh"
 SOLO_ROUTES_SCRIPT="/etc/1002xOPERATOR/dhcp/settings/soloroute.sh"
@@ -284,6 +315,7 @@ while true; do
     # Run route fixer every loop to clean up DHCP-injected duplicate routes
     [[ -x "$DHCP_ROUTES_SCRIPT" ]] && bash "$DHCP_ROUTES_SCRIPT"
     [[ -x "$SOLO_ROUTES_SCRIPT" ]] && bash "$SOLO_ROUTES_SCRIPT"
+    ensure_iptables
     sleep 30
 done
 FAILEOF
