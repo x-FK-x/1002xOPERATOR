@@ -114,9 +114,9 @@ log_r "Processing: ${VALID_IFACES[*]}"
 STATE_FILE="/etc/1002xOPERATOR/dhcp/settings/wan-failover.state"
 METRIC=100
 for iface in "${VALID_IFACES[@]}"; do
-    ip link show "$iface" | grep -q "state UP" || { log_r "$iface DOWN, skipping."; continue; }
-    # Skip suppressed interfaces – failover daemon manages their routes
+    # ERST SUPPRESSED prüfen – verhindert dass Route nach ifdown sofort wieder gesetzt wird
     grep -q "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null && { log_r "$iface suppressed, skipping route fix."; METRIC=$((METRIC + 100)); continue; }
+    ip link show "$iface" | grep -q "state UP" || { log_r "$iface DOWN, skipping."; continue; }
     GW=$(ip route show dev "$iface" | awk '/default/ {print $3}' | head -n1)
     if [[ -z "$GW" ]]; then
         # Try DHCP lease file for real gateway
@@ -525,9 +525,25 @@ if command -v ufw &>/dev/null; then
     log "UFW is installed."
     if ufw status | grep -q "Status: active"; then
         UFW_PROBLEM=0
-        for iface in "${ACTIVE_WAN[@]}"; do
-            ufw status | grep -q "ALLOW.*$iface" || { log "UFW may block forwarding on $iface."; UFW_PROBLEM=1; }
-        done
+
+        # Prüfe ob 'default allow routed' bereits gesetzt ist
+        UFW_VERBOSE=$(ufw status verbose 2>/dev/null)
+        if ! echo "$UFW_VERBOSE" | grep -q "Default:.*allow.*routed"; then
+            log "UFW: Default routed policy is not 'allow' – forwarding may be blocked."
+            UFW_PROBLEM=1
+        else
+            log "UFW: Default routed policy is already 'allow'."
+        fi
+
+        # Prüfe ob eingehender Traffic auf dem LAN-Interface erlaubt ist
+        # ufw status verbose zeigt: "Anywhere on <iface>   ALLOW IN   Anywhere"
+        if ! echo "$UFW_VERBOSE" | grep -q "on $LAN_INTERFACE"; then
+            log "UFW: No ALLOW IN rule for LAN interface $LAN_INTERFACE."
+            UFW_PROBLEM=1
+        else
+            log "UFW: ALLOW IN rule for $LAN_INTERFACE already exists."
+        fi
+
         if [[ "$UFW_PROBLEM" -eq 1 ]]; then
             if ask "Potential UFW issues detected. Fix automatically?"; then
                 ufw default allow routed
