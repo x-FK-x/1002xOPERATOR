@@ -133,7 +133,8 @@ for iface in "${VALID_IFACES[@]}"; do
         mt=$(echo "$route" | awk '/metric/{for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
         [[ -z "$via" ]] && continue
         [[ "$via" == "$GW" && "${mt:-0}" == "$METRIC" ]] && continue
-        ip route delete default via "$via" dev "$iface" ${mt:+metric $mt} 2>/dev/null &&             log_r "Removed duplicate default via $via dev $iface ${mt:+metric $mt}" || true
+        ip route delete default via "$via" dev "$iface" ${mt:+metric $mt} 2>/dev/null && \
+            log_r "Removed duplicate default via $via dev $iface ${mt:+metric $mt}" || true
     done < <(ip route show default dev "$iface")
     ip route replace default via "$GW" dev "$iface" metric "$METRIC"
     log_r "Set default via $GW dev $iface metric $METRIC"
@@ -143,7 +144,8 @@ for iface in "${VALID_IFACES[@]}"; do
         mt=$(echo "$route" | awk '/metric/{for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
         [[ -z "$via" ]] && continue
         [[ "$via" == "$GW" && "${mt:-0}" == "$METRIC" ]] && continue
-        ip route delete default via "$via" dev "$iface" ${mt:+metric $mt} 2>/dev/null &&             log_r "Removed stale default via $via dev $iface ${mt:+metric $mt}" || true
+        ip route delete default via "$via" dev "$iface" ${mt:+metric $mt} 2>/dev/null && \
+            log_r "Removed stale default via $via dev $iface ${mt:+metric $mt}" || true
     done < <(ip route show default dev "$iface")
     METRIC=$((METRIC + 100))
 done
@@ -154,8 +156,9 @@ ROUTEEOF
         if [[ "$FAILOVER_MODE" == "2" ]]; then
 cat > "$FAILOVER_SCRIPT" <<'FAILEOF'
 #!/bin/bash
-# wan-failover.sh – Active WAN Failover (ping + link check, every 30s)
-# Monitors static routes from 1to1route.sh and suspends/restores on interface failure.
+# wan-failover.sh – Active WAN Failover (ifdown/ifup + ping check, every 30s)
+# Fährt ausgefallene Interfaces per ifdown herunter und versucht alle 30s
+# per ifup + Ping-Test sie wieder online zu bringen.
 
 PRIORITY_FILE="/etc/1002xOPERATOR/dhcp/settings/wan-priority.list"
 STATIC_ROUTES_FILE="/etc/1002xOPERATOR/dhcp/settings/static-routes.conf"
@@ -168,6 +171,9 @@ PING_TIMEOUT=2
 
 log_fo() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOGFILE"; }
 
+# ------------------------------------------------------------------
+# check_wan – Gibt 0 zurück wenn Interface online und Ping erfolgreich
+# ------------------------------------------------------------------
 check_wan() {
     local iface="$1"
     ip link show "$iface" 2>/dev/null | grep -q "state UP" || return 1
@@ -176,9 +182,9 @@ check_wan() {
     [[ -z "$ip" ]] && return 1
     local gw
     gw=$(ip route show dev "$iface" | awk '/default/ {print $3}' | head -n1)
-    # If no live route found, check saved state (interface may be suppressed)
+    # Kein Gateway in der Routingtabelle → gespeicherten Gateway aus State verwenden
     [[ -z "$gw" ]] && gw=$(grep "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null | awk '{print $3}' | head -n1)
-    # No .1 fallback – wrong gateway is worse than no check
+    # Kein .1-Fallback – falscher Gateway ist schlimmer als kein Check
     [[ -z "$gw" ]] && { log_fo "[$iface] No gateway found, skipping check"; return 1; }
     ping -c 1 -W "$PING_TIMEOUT" -I "$iface" "$gw" &>/dev/null || { log_fo "[$iface] Gateway $gw unreachable"; return 1; }
     local ok=0
@@ -189,38 +195,94 @@ check_wan() {
     return 0
 }
 
+# ------------------------------------------------------------------
+# suppress_interface – Interface per ifdown herunterfahren + State merken
+# ------------------------------------------------------------------
 suppress_interface() {
     local iface="$1"
+    # Bereits unterdrückt → nichts tun
     grep -q "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null && return 0
-    local route_info
-    route_info=$(ip route show default dev "$iface" | grep -v "metric 50" | head -n1)
-    [[ -z "$route_info" ]] && return 0
-    local gw metric
+
+    local route_info gw metric
+    route_info=$(ip route show default dev "$iface" | head -n1)
     gw=$(echo "$route_info" | awk '{print $3}')
     metric=$(echo "$route_info" | awk '/metric/ {for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
     [[ -z "$metric" ]] && metric=100
+
+    # State VOR ifdown speichern – danach sind IP/Route weg
     echo "SUPPRESSED $iface $gw $metric" >> "$STATE_FILE"
-    ip route del default via "$gw" dev "$iface" metric "$metric" 2>/dev/null || true
-    log_fo "SUPPRESSED: Removed default route for $iface (was via $gw metric $metric)"
+    log_fo "SUPPRESS: Fahre $iface per ifdown herunter (war via $gw metric $metric)"
+
+    # Interface sauber herunterfahren
+    ifdown "$iface" 2>/dev/null \
+        && log_fo "SUPPRESS: ifdown $iface erfolgreich" \
+        || {
+            log_fo "SUPPRESS: ifdown $iface fehlgeschlagen – entferne Route manuell"
+            ip route del default via "$gw" dev "$iface" metric "$metric" 2>/dev/null || true
+        }
 }
 
+# ------------------------------------------------------------------
+# restore_interface – Interface per ifup starten, Ping prüfen, Route setzen
+# ------------------------------------------------------------------
 restore_interface() {
     local iface="$1"
     local entry
     entry=$(grep "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null | head -n1)
     [[ -z "$entry" ]] && return 0
-    local gw metric
-    gw=$(echo "$entry" | awk '{print $3}')
-    metric=$(echo "$entry" | awk '{print $4}')
+
+    local saved_gw saved_metric
+    saved_gw=$(echo "$entry"     | awk '{print $3}')
+    saved_metric=$(echo "$entry" | awk '{print $4}')
+
+    log_fo "RESTORE: Starte $iface per ifup neu..."
+    ifup "$iface" 2>/dev/null \
+        && log_fo "RESTORE: ifup $iface erfolgreich" \
+        || log_fo "RESTORE: ifup $iface fehlgeschlagen – versuche Route manuell"
+
+    # Warten bis DHCP-Zuweisung / Link-Negotiation abgeschlossen ist
+    sleep 4
+
+    # Prüfen ob Interface eine IP bekommen hat
+    local live_ip
+    live_ip=$(ip -4 addr show dev "$iface" | awk '/inet/ {print $2}' | cut -d/ -f1 | head -n1)
+    if [[ -z "$live_ip" ]]; then
+        log_fo "RESTORE: $iface hat nach ifup keine IP – bleibt suppressed"
+        return 1
+    fi
+
+    # Aktuellen Gateway bevorzugen, Fallback auf gespeicherten
     local live_gw
     live_gw=$(ip route show dev "$iface" | awk '/default/ {print $3}' | head -n1)
-    [[ -n "$live_gw" ]] && gw="$live_gw"
-    ip route replace default via "$gw" dev "$iface" metric "$metric" 2>/dev/null || true
-    log_fo "RESTORED: Re-added default route for $iface via $gw metric $metric"
-    grep -v "^SUPPRESSED $iface " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
-    mv "${STATE_FILE}.tmp" "$STATE_FILE"
+    local gw="${live_gw:-$saved_gw}"
+
+    # Default-Route sicherstellen
+    if [[ -n "$gw" ]]; then
+        ip route replace default via "$gw" dev "$iface" metric "$saved_metric" 2>/dev/null \
+            && log_fo "RESTORE: Default-Route via $gw dev $iface metric $saved_metric gesetzt" \
+            || log_fo "RESTORE: Route konnte nicht gesetzt werden (via $gw dev $iface)"
+    else
+        log_fo "RESTORE: Kein Gateway verfügbar für $iface nach ifup"
+        return 1
+    fi
+
+    # Ping-Test – erst bei Erfolg aus dem State entfernen
+    if check_wan "$iface"; then
+        log_fo "RESTORE: $iface Ping erfolgreich – Interface ist wieder online"
+        grep -v "^SUPPRESSED $iface " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
+        mv "${STATE_FILE}.tmp" "$STATE_FILE"
+        return 0
+    else
+        log_fo "RESTORE: $iface nach ifup immer noch nicht erreichbar – bleibt suppressed"
+        # Route wieder entfernen, damit kein Traffic über totes Interface läuft
+        ip route del default via "$gw" dev "$iface" metric "$saved_metric" 2>/dev/null || true
+        return 1
+    fi
 }
 
+# ------------------------------------------------------------------
+# suspend_static_routes / restore_static_routes
+# ------------------------------------------------------------------
 suspend_static_routes() {
     local failed_iface="$1"
     [[ ! -f "$STATIC_ROUTES_FILE" ]] && return
@@ -229,7 +291,8 @@ suspend_static_routes() {
         [[ -z "$line" ]] && continue
         read -r dest iface gw <<< "$line"
         [[ "$iface" != "$failed_iface" ]] && continue
-        grep -qxF "$line" "$SUSPENDED_ROUTES_FILE" 2>/dev/null || { echo "$line" >> "$SUSPENDED_ROUTES_FILE"; log_fo "STATIC-ROUTE SUSPENDED: $dest via $iface ($gw)"; }
+        grep -qxF "$line" "$SUSPENDED_ROUTES_FILE" 2>/dev/null \
+            || { echo "$line" >> "$SUSPENDED_ROUTES_FILE"; log_fo "STATIC-ROUTE SUSPENDED: $dest via $iface ($gw)"; }
         ip route del "$dest" dev "$iface" 2>/dev/null && log_fo "STATIC-ROUTE REMOVED: $dest dev $iface" || true
     done < "$STATIC_ROUTES_FILE"
 }
@@ -256,17 +319,15 @@ restore_static_routes() {
     fi
 }
 
-log_fo "=== WAN Failover daemon started ==="
-touch "$STATE_FILE"
-
-# Ensure NAT & FORWARD iptables rules are in place
+# ------------------------------------------------------------------
+# ensure_iptables – NAT & FORWARD Regeln sicherstellen
+# ------------------------------------------------------------------
 ensure_iptables() {
-    local priority_file="$PRIORITY_FILE"
     local lan_if
     lan_if=$(grep -E '^INTERFACESv4=' /etc/default/isc-dhcp-server 2>/dev/null | cut -d'"' -f2)
     [[ -z "$lan_if" ]] && return
     local wan_list
-    [[ -f "$priority_file" ]] && wan_list=$(tail -n1 "$priority_file") || return
+    [[ -f "$PRIORITY_FILE" ]] && wan_list=$(tail -n1 "$PRIORITY_FILE") || return
     local changed=0
     for iface in $wan_list; do
         ip link show "$iface" &>/dev/null || continue
@@ -288,37 +349,53 @@ ensure_iptables() {
     done
     [[ "$changed" -eq 0 ]] && log_fo "[iptables] All rules OK"
 }
+
+# ------------------------------------------------------------------
+# Startup
+# ------------------------------------------------------------------
+log_fo "=== WAN Failover daemon started ==="
+touch "$STATE_FILE"
 ensure_iptables
 
-# Run route fixer on startup to set correct metrics and remove DHCP duplicates
 DHCP_ROUTES_SCRIPT="/etc/1002xOPERATOR/dhcp/settings/dhcp-routes.sh"
 SOLO_ROUTES_SCRIPT="/etc/1002xOPERATOR/dhcp/settings/soloroute.sh"
 [[ -x "$DHCP_ROUTES_SCRIPT" ]] && bash "$DHCP_ROUTES_SCRIPT"
 [[ -x "$SOLO_ROUTES_SCRIPT" ]] && bash "$SOLO_ROUTES_SCRIPT"
 
+# ------------------------------------------------------------------
+# Hauptschleife
+# ------------------------------------------------------------------
 while true; do
-    if [[ ! -f "$PRIORITY_FILE" ]]; then log_fo "No priority file found, waiting..."; sleep 30; continue; fi
+    if [[ ! -f "$PRIORITY_FILE" ]]; then
+        log_fo "No priority file found, waiting..."
+        sleep 30
+        continue
+    fi
+
     LAST_LINE=$(tail -n1 "$PRIORITY_FILE")
     read -ra WAN_IFACES <<< "$LAST_LINE"
+
     for iface in "${WAN_IFACES[@]}"; do
         ip link show "$iface" &>/dev/null || continue
+
         IS_SUPPRESSED=0
         grep -q "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null && IS_SUPPRESSED=1
-        if check_wan "$iface"; then
-            if [[ "$IS_SUPPRESSED" -eq 1 ]]; then
-                log_fo "$iface is back online – restoring"
-                restore_interface "$iface"
-                restore_static_routes "$iface"
-            fi
+
+        if [[ "$IS_SUPPRESSED" -eq 1 ]]; then
+            # Unterdrücktes Interface: immer per ifup neu starten und Ping testen
+            log_fo "[$iface] ist suppressed – versuche ifup + Ping-Test..."
+            restore_interface "$iface" && restore_static_routes "$iface"
         else
-            if [[ "$IS_SUPPRESSED" -eq 0 ]]; then
-                log_fo "$iface is DOWN or unreachable – suppressing"
+            # Normaler Betrieb: Check ob Interface noch erreichbar ist
+            if ! check_wan "$iface"; then
+                log_fo "$iface ist DOWN oder nicht erreichbar – unterdrücke per ifdown"
                 suppress_interface "$iface"
                 suspend_static_routes "$iface"
             fi
         fi
     done
-    # Run route fixer every loop to clean up DHCP-injected duplicate routes
+
+    # Route-Fixer nach jedem Durchlauf ausführen (bereinigt DHCP-doppelte Routen)
     [[ -x "$DHCP_ROUTES_SCRIPT" ]] && bash "$DHCP_ROUTES_SCRIPT"
     [[ -x "$SOLO_ROUTES_SCRIPT" ]] && bash "$SOLO_ROUTES_SCRIPT"
     ensure_iptables
