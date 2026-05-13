@@ -1,5 +1,6 @@
 #!/bin/bash
 # check.sh – Network setup checker with Multi-WAN priority + Failover (ping + link)
+# PATCH: Default-Route wird erst gesetzt, wenn Gateway UND Internet per Ping bestätigt sind.
 
 set -e
 
@@ -23,13 +24,11 @@ ask()  { read -rp "[QUESTION] $1 [y/N]: " reply; [[ "$reply" =~ ^[Yy]$ ]]; }
 # -------------------------------------------------
 log "Cleaning up previous configuration..."
 
-# Stop and disable failover daemon
 systemctl stop wan-failover 2>/dev/null || true
 systemctl disable wan-failover 2>/dev/null || true
 rm -f /etc/systemd/system/wan-failover.service
 systemctl daemon-reload 2>/dev/null || true
 
-# Remove generated scripts so they get regenerated fresh
 rm -f "$FOLDERSETTINGS/dhcp-routes.sh"
 rm -f "$FOLDERSETTINGS/wan-failover.sh"
 
@@ -114,20 +113,14 @@ log_r "Processing: ${VALID_IFACES[*]}"
 STATE_FILE="/etc/1002xOPERATOR/dhcp/settings/wan-failover.state"
 METRIC=100
 for iface in "${VALID_IFACES[@]}"; do
-    # ERST SUPPRESSED prüfen – verhindert dass Route nach ifdown sofort wieder gesetzt wird
     grep -q "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null && { log_r "$iface suppressed, skipping route fix."; METRIC=$((METRIC + 100)); continue; }
     ip link show "$iface" | grep -q "state UP" || { log_r "$iface DOWN, skipping."; continue; }
     GW=$(ip route show dev "$iface" | awk '/default/ {print $3}' | head -n1)
     if [[ -z "$GW" ]]; then
-        # Try DHCP lease file for real gateway
-        IP_ADDR=$(ip -4 addr show dev "$iface" | awk '/inet/ {print $2}' | cut -d/ -f1 | head -n1)
-        # Try NetworkManager
         GW=$(nmcli -g IP4.GATEWAY device show "$iface" 2>/dev/null | head -n1)
-        # Try reading from ip route table (any route, not just default)
         [[ -z "$GW" ]] && GW=$(ip route show dev "$iface" | awk '/via/ {print $3}' | head -n1)
     fi
-    [[ -z "$GW" ]] && log_r "No gateway found for $iface – skipping (no .1 fallback to avoid wrong gateway)." && continue
-    # Remove ALL default routes for this interface (DHCP proto or any duplicate)
+    [[ -z "$GW" ]] && log_r "No gateway found for $iface – skipping." && continue
     while IFS= read -r route; do
         via=$(echo "$route" | awk '{print $3}')
         mt=$(echo "$route" | awk '/metric/{for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
@@ -138,7 +131,6 @@ for iface in "${VALID_IFACES[@]}"; do
     done < <(ip route show default dev "$iface")
     ip route replace default via "$GW" dev "$iface" metric "$METRIC"
     log_r "Set default via $GW dev $iface metric $METRIC"
-    # Remove ALL remaining default routes for this interface that are not our clean one
     while IFS= read -r route; do
         via=$(echo "$route" | awk '{print $3}')
         mt=$(echo "$route" | awk '/metric/{for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
@@ -157,8 +149,9 @@ ROUTEEOF
 cat > "$FAILOVER_SCRIPT" <<'FAILEOF'
 #!/bin/bash
 # wan-failover.sh – Active WAN Failover (ifdown/ifup + ping check, every 30s)
-# Fährt ausgefallene Interfaces per ifdown herunter und versucht alle 30s
-# per ifup + Ping-Test sie wieder online zu bringen.
+# PATCH: Default-Route wird erst gesetzt, wenn Gateway UND Internet per Ping bestätigt sind.
+#        Zwischenzeitlich wird eine temporäre ip-rule + eigene Routingtabelle verwendet,
+#        damit der Probe-Ping das Interface nutzen kann – ohne den globalen Traffic umzulenken.
 
 PRIORITY_FILE="/etc/1002xOPERATOR/dhcp/settings/wan-priority.list"
 STATIC_ROUTES_FILE="/etc/1002xOPERATOR/dhcp/settings/static-routes.conf"
@@ -169,10 +162,85 @@ PING_TARGETS=("8.8.8.8" "1.1.1.1" "9.9.9.9")
 PING_COUNT=3
 PING_TIMEOUT=2
 
+PROBE_TABLE_BASE=200
+
 log_fo() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOGFILE"; }
 
 # ------------------------------------------------------------------
-# check_wan – Gibt 0 zurück wenn Interface online und Ping erfolgreich
+# _iface_table_id – stabile Routing-Tabellen-ID pro Interface
+# ------------------------------------------------------------------
+_iface_table_id() {
+    local iface="$1"
+    local idx=0
+    if [[ -f "$PRIORITY_FILE" ]]; then
+        local list
+        read -ra list < <(tail -n1 "$PRIORITY_FILE")
+        for i in "${!list[@]}"; do
+            [[ "${list[$i]}" == "$iface" ]] && idx=$i && break
+        done
+    fi
+    echo $((PROBE_TABLE_BASE + idx))
+}
+
+# ------------------------------------------------------------------
+# _probe_wan_via_temp_rule
+#   Testet Gateway + Internet per Ping, OHNE die globale Default-Route
+#   zu verändern. Nutzt temporäre ip rule + eigene Routing-Tabelle.
+#   Gibt 0 bei Erfolg zurück, 1 bei Fehlschlag. Räumt sich immer selbst auf.
+# ------------------------------------------------------------------
+_probe_wan_via_temp_rule() {
+    local iface="$1"
+    local gw="$2"
+    local tid
+    tid=$(_iface_table_id "$iface")
+
+    local src_ip
+    src_ip=$(ip -4 addr show dev "$iface" | awk '/inet/ {print $2}' | cut -d/ -f1 | head -n1)
+    [[ -z "$src_ip" ]] && { log_fo "PROBE [$iface] Keine src-IP für temp-rule"; return 1; }
+
+    # Altlasten bereinigen
+    ip rule del from "$src_ip" table "$tid" 2>/dev/null || true
+    ip route flush table "$tid" 2>/dev/null || true
+
+    # Temporäre Tabelle und Policy anlegen
+    ip route add default via "$gw" dev "$iface" table "$tid" 2>/dev/null \
+        || { log_fo "PROBE [$iface] ip route add table $tid fehlgeschlagen"; return 1; }
+    ip rule add from "$src_ip" table "$tid" priority "$((tid * 10))" 2>/dev/null \
+        || { ip route flush table "$tid" 2>/dev/null; log_fo "PROBE [$iface] ip rule add fehlgeschlagen"; return 1; }
+
+    log_fo "PROBE [$iface] Temp-Policy aktiv: src=$src_ip → table $tid via $gw"
+
+    local result=1
+
+    # Gateway-Ping
+    if ! ping -c 1 -W "$PING_TIMEOUT" -I "$iface" "$gw" &>/dev/null; then
+        log_fo "PROBE [$iface] Gateway $gw nicht erreichbar"
+    else
+        # Internet-Ping
+        local ok=0
+        for target in "${PING_TARGETS[@]}"; do
+            if ping -c "$PING_COUNT" -W "$PING_TIMEOUT" -I "$iface" "$target" &>/dev/null; then
+                ok=1
+                log_fo "PROBE [$iface] Internet erreichbar via $target"
+                break
+            fi
+        done
+        [[ "$ok" -eq 1 ]] && result=0 || log_fo "PROBE [$iface] Kein Internet (alle Ping-Ziele failed)"
+    fi
+
+    # Temp-Policy immer aufräumen
+    ip rule del from "$src_ip" table "$tid" priority "$((tid * 10))" 2>/dev/null \
+        && log_fo "PROBE [$iface] ip rule entfernt" \
+        || log_fo "PROBE [$iface] WARNUNG: ip rule konnte nicht entfernt werden"
+    ip route flush table "$tid" 2>/dev/null \
+        && log_fo "PROBE [$iface] Temp-Route entfernt" \
+        || log_fo "PROBE [$iface] WARNUNG: Temp-Route konnte nicht entfernt werden"
+
+    return $result
+}
+
+# ------------------------------------------------------------------
+# check_wan – Laufendes Interface auf Erreichbarkeit prüfen
 # ------------------------------------------------------------------
 check_wan() {
     local iface="$1"
@@ -182,16 +250,14 @@ check_wan() {
     [[ -z "$ip" ]] && return 1
     local gw
     gw=$(ip route show dev "$iface" | awk '/default/ {print $3}' | head -n1)
-    # Kein Gateway in der Routingtabelle → gespeicherten Gateway aus State verwenden
     [[ -z "$gw" ]] && gw=$(grep "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null | awk '{print $3}' | head -n1)
-    # Kein .1-Fallback – falscher Gateway ist schlimmer als kein Check
-    [[ -z "$gw" ]] && { log_fo "[$iface] No gateway found, skipping check"; return 1; }
-    ping -c 1 -W "$PING_TIMEOUT" -I "$iface" "$gw" &>/dev/null || { log_fo "[$iface] Gateway $gw unreachable"; return 1; }
+    [[ -z "$gw" ]] && { log_fo "[$iface] Kein Gateway für check_wan"; return 1; }
+    ping -c 1 -W "$PING_TIMEOUT" -I "$iface" "$gw" &>/dev/null || { log_fo "[$iface] Gateway $gw nicht erreichbar"; return 1; }
     local ok=0
     for target in "${PING_TARGETS[@]}"; do
         ping -c "$PING_COUNT" -W "$PING_TIMEOUT" -I "$iface" "$target" &>/dev/null && ok=1 && break
     done
-    [[ "$ok" -eq 1 ]] || { log_fo "[$iface] No internet connectivity"; return 1; }
+    [[ "$ok" -eq 1 ]] || { log_fo "[$iface] Keine Internet-Konnektivität"; return 1; }
     return 0
 }
 
@@ -200,7 +266,6 @@ check_wan() {
 # ------------------------------------------------------------------
 suppress_interface() {
     local iface="$1"
-    # Bereits unterdrückt → nichts tun
     grep -q "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null && return 0
 
     local route_info gw metric
@@ -209,11 +274,9 @@ suppress_interface() {
     metric=$(echo "$route_info" | awk '/metric/ {for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
     [[ -z "$metric" ]] && metric=100
 
-    # State VOR ifdown speichern – danach sind IP/Route weg
     echo "SUPPRESSED $iface $gw $metric" >> "$STATE_FILE"
     log_fo "SUPPRESS: Fahre $iface per ifdown herunter (war via $gw metric $metric)"
 
-    # Interface sauber herunterfahren
     ifdown "$iface" 2>/dev/null \
         && log_fo "SUPPRESS: ifdown $iface erfolgreich" \
         || {
@@ -223,7 +286,8 @@ suppress_interface() {
 }
 
 # ------------------------------------------------------------------
-# restore_interface – Interface per ifup starten, Ping prüfen, Route setzen
+# restore_interface
+# PATCH: Default-Route wird erst nach erfolgreichem Probe-Ping gesetzt.
 # ------------------------------------------------------------------
 restore_interface() {
     local iface="$1"
@@ -238,46 +302,54 @@ restore_interface() {
     log_fo "RESTORE: Starte $iface per ifup neu..."
     ifup "$iface" 2>/dev/null \
         && log_fo "RESTORE: ifup $iface erfolgreich" \
-        || log_fo "RESTORE: ifup $iface fehlgeschlagen – versuche Route manuell"
+        || log_fo "RESTORE: ifup $iface fehlgeschlagen – versuche Probe trotzdem"
 
-    # Warten bis DHCP-Zuweisung / Link-Negotiation abgeschlossen ist
     sleep 4
 
-    # Prüfen ob Interface eine IP bekommen hat
+    # IP prüfen
     local live_ip
     live_ip=$(ip -4 addr show dev "$iface" | awk '/inet/ {print $2}' | cut -d/ -f1 | head -n1)
     if [[ -z "$live_ip" ]]; then
-        log_fo "RESTORE: $iface hat nach ifup keine IP – bleibt suppressed"
+        log_fo "RESTORE: $iface hat nach ifup keine IP – bleibt suppressed (kein Route-Setzen)"
         return 1
     fi
 
-    # Aktuellen Gateway bevorzugen, Fallback auf gespeicherten
+    # Gateway ermitteln
     local live_gw
     live_gw=$(ip route show dev "$iface" | awk '/default/ {print $3}' | head -n1)
     local gw="${live_gw:-$saved_gw}"
 
-    # Default-Route sicherstellen
-    if [[ -n "$gw" ]]; then
-        ip route replace default via "$gw" dev "$iface" metric "$saved_metric" 2>/dev/null \
-            && log_fo "RESTORE: Default-Route via $gw dev $iface metric $saved_metric gesetzt" \
-            || log_fo "RESTORE: Route konnte nicht gesetzt werden (via $gw dev $iface)"
-    else
-        log_fo "RESTORE: Kein Gateway verfügbar für $iface nach ifup"
+    if [[ -z "$gw" ]]; then
+        log_fo "RESTORE: Kein Gateway für $iface – bleibt suppressed (kein Route-Setzen)"
         return 1
     fi
 
-    # Ping-Test – erst bei Erfolg aus dem State entfernen
-    if check_wan "$iface"; then
-        log_fo "RESTORE: $iface Ping erfolgreich – Interface ist wieder online"
-        grep -v "^SUPPRESSED $iface " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
-        mv "${STATE_FILE}.tmp" "$STATE_FILE"
-        return 0
-    else
-        log_fo "RESTORE: $iface nach ifup immer noch nicht erreichbar – bleibt suppressed"
-        # Route wieder entfernen, damit kein Traffic über totes Interface läuft
-        ip route del default via "$gw" dev "$iface" metric "$saved_metric" 2>/dev/null || true
+    # *** KERNPATCH: Erst Probe via temp-rule, dann Route setzen ***
+    log_fo "RESTORE: Starte Probe-Ping für $iface via $gw (OHNE globale Default-Route)"
+    if ! _probe_wan_via_temp_rule "$iface" "$gw"; then
+        log_fo "RESTORE: $iface Probe fehlgeschlagen – setze KEINE Default-Route, bleibt suppressed"
+        # Von ifup evtl. automatisch gesetzte Routen wieder entfernen
+        while IFS= read -r route; do
+            local via mt
+            via=$(echo "$route" | awk '{print $3}')
+            mt=$(echo "$route" | awk '/metric/{for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
+            [[ -z "$via" ]] && continue
+            ip route del default via "$via" dev "$iface" ${mt:+metric $mt} 2>/dev/null && \
+                log_fo "RESTORE: Unerwünschte Route entfernt: via $via dev $iface ${mt:+metric $mt}" || true
+        done < <(ip route show default dev "$iface")
         return 1
     fi
+
+    # Probe erfolgreich → jetzt erst in Haupttabelle eintragen
+    log_fo "RESTORE: Probe erfolgreich – setze Default-Route via $gw dev $iface metric $saved_metric"
+    ip route replace default via "$gw" dev "$iface" metric "$saved_metric" 2>/dev/null \
+        && log_fo "RESTORE: Default-Route gesetzt" \
+        || log_fo "RESTORE: WARNUNG – Route konnte nicht gesetzt werden (via $gw dev $iface metric $saved_metric)"
+
+    grep -v "^SUPPRESSED $iface " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
+    mv "${STATE_FILE}.tmp" "$STATE_FILE"
+    log_fo "RESTORE: $iface erfolgreich wiederhergestellt und aus STATE entfernt"
+    return 0
 }
 
 # ------------------------------------------------------------------
@@ -360,7 +432,7 @@ ensure_iptables
 DHCP_ROUTES_SCRIPT="/etc/1002xOPERATOR/dhcp/settings/dhcp-routes.sh"
 SOLO_ROUTES_SCRIPT="/etc/1002xOPERATOR/dhcp/settings/soloroute.sh"
 [[ -x "$DHCP_ROUTES_SCRIPT" ]] && bash "$DHCP_ROUTES_SCRIPT"
-[[ -x "$SOLO_ROUTES_SCRIPT" ]] && bash "$SOLO_ROUTES_SCRIPT"
+[[ -x "$SOLO_ROUTES_SCRIPT" ]]  && bash "$SOLO_ROUTES_SCRIPT"
 
 # ------------------------------------------------------------------
 # Hauptschleife
@@ -382,11 +454,9 @@ while true; do
         grep -q "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null && IS_SUPPRESSED=1
 
         if [[ "$IS_SUPPRESSED" -eq 1 ]]; then
-            # Unterdrücktes Interface: immer per ifup neu starten und Ping testen
-            log_fo "[$iface] ist suppressed – versuche ifup + Ping-Test..."
+            log_fo "[$iface] ist suppressed – versuche ifup + Probe-Ping..."
             restore_interface "$iface" && restore_static_routes "$iface"
         else
-            # Normaler Betrieb: Check ob Interface noch erreichbar ist
             if ! check_wan "$iface"; then
                 log_fo "$iface ist DOWN oder nicht erreichbar – unterdrücke per ifdown"
                 suppress_interface "$iface"
@@ -395,9 +465,8 @@ while true; do
         fi
     done
 
-    # Route-Fixer nach jedem Durchlauf ausführen (bereinigt DHCP-doppelte Routen)
     [[ -x "$DHCP_ROUTES_SCRIPT" ]] && bash "$DHCP_ROUTES_SCRIPT"
-    [[ -x "$SOLO_ROUTES_SCRIPT" ]] && bash "$SOLO_ROUTES_SCRIPT"
+    [[ -x "$SOLO_ROUTES_SCRIPT" ]]  && bash "$SOLO_ROUTES_SCRIPT"
     ensure_iptables
     sleep 30
 done
@@ -436,7 +505,7 @@ SVCEOF
             log "Metric-based routing only – no active failover daemon installed."
         fi
 
-        # Remove any leftover cronjob (replaced by systemd service)
+        # Remove any leftover cronjob
         if crontab -l 2>/dev/null | grep -qF "$DHCP_SCRIPT"; then
             crontab -l 2>/dev/null | grep -vF "$DHCP_SCRIPT" | crontab -
             log "Removed legacy cronjob for dhcp-routes.sh"
@@ -526,7 +595,6 @@ if command -v ufw &>/dev/null; then
     if ufw status | grep -q "Status: active"; then
         UFW_PROBLEM=0
 
-        # Prüfe ob 'default allow routed' bereits gesetzt ist
         UFW_VERBOSE=$(ufw status verbose 2>/dev/null)
         if ! echo "$UFW_VERBOSE" | grep -q "Default:.*allow.*routed"; then
             log "UFW: Default routed policy is not 'allow' – forwarding may be blocked."
@@ -535,8 +603,6 @@ if command -v ufw &>/dev/null; then
             log "UFW: Default routed policy is already 'allow'."
         fi
 
-        # Prüfe ob eingehender Traffic auf dem LAN-Interface erlaubt ist
-        # ufw status verbose zeigt: "Anywhere on <iface>   ALLOW IN   Anywhere"
         if ! echo "$UFW_VERBOSE" | grep -q "on $LAN_INTERFACE"; then
             log "UFW: No ALLOW IN rule for LAN interface $LAN_INTERFACE."
             UFW_PROBLEM=1
