@@ -9,8 +9,8 @@ FAILOVER_STATE="$FOLDERSETTINGS/wan-failover.state"
 FAILOVER_LOG="/var/log/wan-failover.log"
 
 PING_TARGETS=("8.8.8.8" "1.1.1.1" "9.9.9.9")
-PING_COUNT=3
-PING_TIMEOUT=4
+PING_COUNT=4
+PING_TIMEOUT=10
 
 log()  { echo "[INFO] $1"; }
 warn() { echo "[WARN] $1"; }
@@ -153,8 +153,8 @@ SUSPENDED_ROUTES_FILE="/etc/1002xOPERATOR/dhcp/settings/static-routes.suspended"
 STATE_FILE="/etc/1002xOPERATOR/dhcp/settings/wan-failover.state"
 LOGFILE="/var/log/wan-failover.log"
 PING_TARGETS=("8.8.8.8" "1.1.1.1" "9.9.9.9")
-PING_COUNT=3
-PING_TIMEOUT=2
+PING_COUNT=4
+PING_TIMEOUT=10
 
 
 TEST_TABLE_BASE=1000
