@@ -49,7 +49,7 @@ done
 ACTIVE_WAN=()
 for iface in "${WAN_INTERFACES[@]}"; do
     IP=$(ip -o -4 addr show "$iface" 2>/dev/null | awk 'NR==1 {print $4}' | cut -d/ -f1)
-    if [[ -z "$IP" ]]; then log "Skipping $iface â€“ no IPv4 address assigned"; continue; fi
+    if [[ -z "$IP" ]]; then log "Skipping $iface, no IPv4 address assigned"; continue; fi
     GW=$(ip route show dev "$iface" | awk '/default/ {print $3}' | head -n1)
     log "Detected WAN interface: $iface with IP $IP and Gateway ${GW:-none}"
     ACTIVE_WAN+=("$iface")
