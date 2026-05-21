@@ -10,7 +10,7 @@ FAILOVER_LOG="/var/log/wan-failover.log"
 
 PING_TARGETS=("8.8.8.8" "1.1.1.1" "9.9.9.9")
 PING_COUNT=3
-PING_TIMEOUT=2
+PING_TIMEOUT=4
 
 log()  { echo "[INFO] $1"; }
 warn() { echo "[WARN] $1"; }
