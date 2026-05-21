@@ -60,7 +60,7 @@ if (( ${#ACTIVE_WAN[@]} > 1 )); then
     warn "Multiple WAN interfaces detected: ${ACTIVE_WAN[*]}"
     RP_ALL=$(sysctl -n net.ipv4.conf.all.rp_filter)
     RP_DEF=$(sysctl -n net.ipv4.conf.default.rp_filter)
-    [[ "$RP_ALL" -ne 0 || "$RP_DEF" -ne 0 ]] && warn "rp_filter enabled â€“ asymmetric routing likely"
+    [[ "$RP_ALL" -ne 0 || "$RP_DEF" -ne 0 ]] && warn "rp_filter enabled, asymmetric routing likely"
     warn "Multi-WAN without explicit priorities may break forwarding"
 
     if ask "Configure WAN priority + Failover now?"; then
@@ -85,7 +85,7 @@ if (( ${#ACTIVE_WAN[@]} > 1 )); then
         echo
         echo "Failover mode options:"
         echo "  1) Active failover â€“ ping + link check, switches default route [recommended]"
-        echo "  2) Metric-based only â€“ kernel picks lowest metric active route"
+        echo "  2) Metric-based only, kernel picks lowest metric active route"
         read -rp "Select mode [1/2] (default: 1): " FAILOVER_MODE_INPUT
         case "$FAILOVER_MODE_INPUT" in
             2) FAILOVER_MODE="1" ;;
