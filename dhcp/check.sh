@@ -193,7 +193,7 @@ _TEST_wan_via_temp_rule() {
     ip rule add from "$src_ip" table "$tid" priority "$((tid * 10))" 2>/dev/null \
         || { ip route flush table "$tid" 2>/dev/null; log_fo "TEST [$iface] ip rule add failed"; return 1; }
 
-    log_fo "TEST [$iface] Temp-Policy active: src=$src_ip â†’ table $tid via $gw"
+    log_fo "TEST [$iface] Temp-Policy active: src=$src_ip; table $tid via $gw"
 
     local result=1
 
