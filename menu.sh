@@ -10,10 +10,11 @@ declare -A COLLECTIONS
 COLLECTIONS["dhcp.sh"]="DHCP Operator scripts and management tools"
 COLLECTIONS["samba.sh"]="Samba Public Standalone Server"
 COLLECTIONS["ufw.sh"]="UFW Firewall – Security and network protection"
-COLLECTIONS["webgui.sh"]="WebGUI – Portal, Network & Samba (Port 8080-8082)"
+COLLECTIONS["webgui.sh"]="WebGUI – Portal, Network & Samba (Port 8080-8083)"
+COLLECTIONS["dns.sh"]="DNS Server – dnsmasq setup, hosts, zones and adblock"
 
 # === Menu order ===
-MENU_ORDER=("dhcp.sh" "samba.sh" "ufw.sh" "webgui.sh")
+MENU_ORDER=("dhcp.sh" "samba.sh" "ufw.sh" "webgui.sh" "dns.sh")
 
 # === Build menu options ===
 MENU_OPTIONS=()
@@ -23,7 +24,7 @@ done
 
 # === Show Whiptail main menu ===
 CHOICE=$(whiptail --title "1002xOPERATOR Main Menu" \
-    --menu "Select a script collection to enter:" 15 70 6 \
+    --menu "Select a script collection to enter:" 16 72 6 \
     "${MENU_OPTIONS[@]}" 3>&1 1>&2 2>&3)
 
 # === Make all scripts executable recursively ===
