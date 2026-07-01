@@ -169,7 +169,7 @@ page_routes() {
     body="<h1>Static Routes</h1>${msg}
 <div class='card'><h2>Add route</h2>
 <form method='POST' action='/routes/add'><div class='form-row'>
-<div class='form-group'><label>Destination</label><input type='text' name='dest' placeholder='178.15.44.66 oder 10.5.0.0/24'></div>
+<div class='form-group'><label>Destination</label><input type='text' name='dest' placeholder='172.16.1.1 or 10.5.0.0/24'></div>
 <div class='form-group'><label>Interface</label><select name='iface'>$select_opts</select></div>
 <div class='form-group'><label>Gateway (optional)</label><input type='text' name='gw' placeholder='auto'></div>
 <button class='btn btn-primary' type='submit'>+ Add</button>
