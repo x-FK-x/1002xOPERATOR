@@ -434,4 +434,6 @@ while true; do
         update)    update_all ;;
         toggle)    toggle_adblock ;;
     esac
+    echo "[INFO] Restart dnsmasq service"
+    systemctl restart dnsmasq
 done
