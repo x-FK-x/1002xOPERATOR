@@ -9,6 +9,8 @@ ADBLOCK_DIR="/etc/1002xOPERATOR/dns/blocklists"
 WHITELIST_FILE="/etc/1002xOPERATOR/dns/whitelist.txt"
 SINKHOLE_IP="0.0.0.0"
 
+grep -q "^filter-AAAA" /etc/dnsmasq.conf || echo "filter-AAAA" >> /etc/dnsmasq.conf
+
 log()   { echo "[INFO] $1"; }
 warn()  { echo "[WARN] $1"; }
 error() { echo "[ERROR] $1"; exit 1; }
