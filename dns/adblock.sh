@@ -10,6 +10,7 @@ WHITELIST_FILE="/etc/1002xOPERATOR/dns/whitelist.txt"
 SINKHOLE_IP="0.0.0.0"
 
 grep -q "^filter-AAAA" /etc/dnsmasq.conf || echo "filter-AAAA" >> /etc/dnsmasq.conf
+grep -q "log-queries" /etc/dnsmasq.conf || echo "log-queries" >> /etc/dnsmasq.conf; grep -q "log-facility" /etc/dnsmasq.conf || echo "log-facility=/var/log/dnsmasq.log" >> /etc/dnsmasq.conf
 
 log()   { echo "[INFO] $1"; }
 warn()  { echo "[WARN] $1"; }
