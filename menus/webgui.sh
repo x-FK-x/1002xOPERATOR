@@ -10,7 +10,10 @@ SERVICES=(
     "1002x-dhcp-webui"   "DHCP WebUI     (Port 8081)" "dhcp.sh"
     "1002x-samba-webui"  "Samba WebUI    (Port 8082)" "samba.sh"
     "1002x-ufw-webui"    "UFW Dashboard  (Port 8083)" "ufw-webinterface.sh"
+    "1002x-dns-webui"    "DNS WebUI      (Port 8084)" "dns.sh"
 )
+
+PORTS=(8080 8081 8082 8083 8084)
 
 get_status() {
     systemctl is-active "$1" 2>/dev/null
@@ -44,7 +47,7 @@ install_all() {
     mkdir -p "$WEBGUI_DIR"
 
     local missing=""
-    for script in portal.sh dhcp.sh samba.sh ufw-webinterface.sh; do
+    for script in portal.sh dhcp.sh samba.sh ufw-webinterface.sh dns.sh; do
         [[ ! -f "$WEBGUI_DIR/$script" ]] && missing+="  $script\n"
     done
     if [[ -n "$missing" ]]; then
@@ -117,6 +120,24 @@ After=network.target ufw.service
 [Service]
 Type=simple
 ExecStart=/bin/bash /etc/1002xOPERATOR/webgui/ufw-webinterface.sh 8083
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # DNS WebUI Service
+    cat > "$SERVICE_DIR/1002x-dns-webui.service" <<'EOF'
+[Unit]
+Description=1002xOPERATOR DNS Web Interface
+After=network.target dnsmasq.service
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /etc/1002xOPERATOR/webgui/dns.sh 8084
 Restart=always
 RestartSec=3
 StandardOutput=journal
@@ -237,7 +258,7 @@ while true; do
         install_all)
             if install_all; then
                 IP=$(get_lan_ip)
-                whiptail --msgbox "✓ WebGUI services installed and started!\n\nPortal:  http://$IP:8080\nDHCP:    http://$IP:8081\nSamba:   http://$IP:8082\nUFW:     http://$IP:8083" 14 58
+                whiptail --msgbox "✓ WebGUI services installed and started!\n\nPortal:  http://$IP:8080\nDHCP:    http://$IP:8081\nSamba:   http://$IP:8082\nUFW:     http://$IP:8083\nDNS:     http://$IP:8084" 16 58
             fi
             ;;
         install_sel)
@@ -264,7 +285,8 @@ while true; do
             for (( i=0; i<${#SERVICES[@]}; i+=3 )); do
                 if [[ "${SERVICES[$i]}" == "$SVC_CHOICE" ]]; then
                     SCRIPT="${SERVICES[$i+2]}"
-                    PORT=$((8080 + i/3))
+                    PORT_IDX=$((i/3))
+                    PORT="${PORTS[$PORT_IDX]}"
                     install_service "$SVC_CHOICE" "$SCRIPT" "$PORT"
                     break
                 fi
