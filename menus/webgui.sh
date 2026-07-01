@@ -206,20 +206,7 @@ EOF
     return 0
 }
 
-remove_service() {
-    local svc="$1"
-    
-    whiptail --yesno "Remove service $svc?" 8 50
-    [[ $? -ne 0 ]] && return 1
-    
-    systemctl stop "$svc" 2>/dev/null
-    systemctl disable "$svc" 2>/dev/null
-    rm -f "$SERVICE_DIR/$svc.service"
-    systemctl daemon-reload
-    
-    whiptail --msgbox "$svc removed" 8 50
-    return 0
-}
+
 
 # Main Loop
 while true; do
