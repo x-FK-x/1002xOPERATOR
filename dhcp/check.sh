@@ -193,7 +193,7 @@ _TEST_wan_via_temp_rule() {
     ip rule add from "$src_ip" table "$tid" priority "$((tid * 10))" 2>/dev/null \
         || { ip route flush table "$tid" 2>/dev/null; log_fo "TEST [$iface] ip rule add failed"; return 1; }
 
-    log_fo "TEST [$iface] Temp-Policy active: src=$src_ip; table $tid via $gw"
+    log_fo "TEST [$iface] Temp-Policy active: src=$src_ip â†’ table $tid via $gw"
 
     local result=1
 
@@ -294,9 +294,46 @@ restore_interface() {
         return 1
     fi
 
+    # ------------------------------------------------------------------
+    # Cooldown-Logik: bei jedem fehlgeschlagenen Test wird die Wartezeit
+    # verdoppelt (30s → 60s → 120s → … bis max. 600s).
+    # Format in STATE_FILE: COOLDOWN <iface> <next_allowed_epoch> <current_cooldown_s>
+    # ------------------------------------------------------------------
+    local cooldown_entry next_allowed current_cooldown now
+    cooldown_entry=$(grep "^COOLDOWN $iface " "$STATE_FILE" 2>/dev/null | head -n1)
+    now=$(date +%s)
+
+    if [[ -n "$cooldown_entry" ]]; then
+        next_allowed=$(echo "$cooldown_entry" | awk '{print $3}')
+        current_cooldown=$(echo "$cooldown_entry" | awk '{print $4}')
+        if (( now < next_allowed )); then
+            local remaining=$(( next_allowed - now ))
+            log_fo "RESTORE: [$iface] Cooldown active – ${remaining}s remaining until next test"
+            return 1
+        fi
+        log_fo "RESTORE: [$iface] Cooldown expired (was ${current_cooldown}s), starting TEST-Ping..."
+    else
+        current_cooldown=0
+    fi
+
     log_fo "RESTORE: Start TEST-Ping for $iface via $gw (NO global Default-Route)"
     if ! _TEST_wan_via_temp_rule "$iface" "$gw"; then
         log_fo "RESTORE: $iface TEST failed, add NO Default-Route, stays suppressed"
+
+        # Cooldown erhöhen (Verdopplung, min 30s, max 600s)
+        if (( current_cooldown == 0 )); then
+            current_cooldown=30
+        else
+            current_cooldown=$(( current_cooldown * 2 ))
+        fi
+        (( current_cooldown > 600 )) && current_cooldown=600
+        local next_ts=$(( now + current_cooldown ))
+
+        # Alten Cooldown-Eintrag ersetzen
+        grep -v "^COOLDOWN $iface " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
+        echo "COOLDOWN $iface $next_ts $current_cooldown" >> "${STATE_FILE}.tmp"
+        mv "${STATE_FILE}.tmp" "$STATE_FILE"
+        log_fo "RESTORE: [$iface] Cooldown set to ${current_cooldown}s (next attempt at: $(date -d @$next_ts '+%H:%M:%S'))"
 
         while IFS= read -r route; do
             local via mt
@@ -308,6 +345,11 @@ restore_interface() {
         done < <(ip route show default dev "$iface")
         return 1
     fi
+
+    # Test erfolgreich → Cooldown-Eintrag entfernen
+    grep -v "^COOLDOWN $iface " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
+    mv "${STATE_FILE}.tmp" "$STATE_FILE"
+    log_fo "RESTORE: [$iface] TEST successful, cooldown reset"
 
 
     log_fo "RESTORE: TEST successfully, ADD Default-Route via $gw dev $iface metric $saved_metric"
