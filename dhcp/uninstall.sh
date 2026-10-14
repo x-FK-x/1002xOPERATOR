@@ -11,6 +11,7 @@ ISC_DEFAULT="/etc/default/isc-dhcp-server"
 SYSCTL_FILE="/etc/sysctl.d/99-1002xoperator.conf"
 SERVICE="isc-dhcp-server"
 ROUTE_MARK="soloroute.sh"
+FAILOVER_UNIT="/etc/systemd/system/wan-failover.service"
 WEBUI_PATTERN='/dhcp\.sh( |$)'
 
 log()  { echo "[INFO] $1"; }
@@ -136,6 +137,16 @@ remove_static_routes() {
     log "Removed saved static routes from the kernel."
 }
 
+remove_failover() {
+    systemctl stop wan-failover 2>/dev/null || true
+    systemctl disable wan-failover >/dev/null 2>&1 || true
+    if [[ -f $FAILOVER_UNIT ]]; then
+        rm -f "$FAILOVER_UNIT"
+        log "Removed wan-failover service"
+    fi
+    systemctl daemon-reload 2>/dev/null || true
+}
+
 remove_cron_jobs() {
     crontab -l 2>/dev/null | grep -vE "$ROUTE_MARK|1002xOPERATOR" | crontab - 2>/dev/null || true
     log "Removed 1002xOPERATOR cron jobs."
@@ -145,7 +156,7 @@ uninstall_operator() {
     local ans purge disable_fwd bak f tmp
 
     ans=$(whiptail --title "Uninstall DHCP Operator" --inputbox \
-        "This removes the DHCP Operator setup: the DHCP service, the web interface, the LAN address and its stanza, the access point profile, NAT and forwarding rules, the sysctl drop-in, the static routes and their cron job, and the settings.\n\nA backup of the changed config files is kept in $BACKUP_ROOT.\n\nType UNINSTALL to continue:" \
+        "This removes the DHCP Operator setup: the DHCP service, the web interface, the LAN address and its stanza, the access point profile, NAT and forwarding rules, the sysctl drop-in, the WAN failover service, the static routes and their cron job, and the settings.\n\nA backup of the changed config files is kept in $BACKUP_ROOT.\n\nType UNINSTALL to continue:" \
         16 74 3>&1 1>&2 2>&3) || { log "Uninstall cancelled."; return; }
     if [[ $ans != "UNINSTALL" ]]; then
         log "Uninstall cancelled."
@@ -175,6 +186,7 @@ uninstall_operator() {
     systemctl disable "$SERVICE" >/dev/null 2>&1 || true
     log "DHCP service stopped and disabled."
 
+    remove_failover
     remove_static_routes
     remove_cron_jobs
     remove_firewall_rules

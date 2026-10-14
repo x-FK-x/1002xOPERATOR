@@ -1,5 +1,5 @@
 #!/bin/bash
-# reset-dhcp.sh – deletes the settings folder and static-hosts* files, then runs firstrun.sh
+# reset-dhcp.sh – stops the WAN failover service, deletes the settings folder and static-hosts* files, then runs firstrun.sh
 set -uo pipefail
 
 [[ $EUID -eq 0 ]] || { echo "[ERROR] Must be run as root."; exit 1; }
@@ -9,14 +9,16 @@ FIRSTRUN="$BASE_DIR/firstrun.sh"
 SETTINGS_DIR="$BASE_DIR/settings"
 DHCP_DIR="/etc/dhcp"
 DHCPD_CONF="$DHCP_DIR/dhcpd.conf"
+FAILOVER_UNIT="/etc/systemd/system/wan-failover.service"
 STATIC_INCLUDE_RE='^[[:space:]]*include[[:space:]]+"/etc/dhcp/static-hosts\.conf";'
 
 echo "=== DHCP Reset Script ==="
 echo "This will delete:"
+echo " - the wan-failover service (stopped and removed)"
 echo " - $SETTINGS_DIR (incl. saved routes)"
 echo " - all $DHCP_DIR/static-hosts* files"
 echo " - the static-hosts include line in $DHCPD_CONF"
-echo " - the soloroute.sh cronjob"
+echo " - the soloroute.sh and dhcp-routes.sh cronjobs"
 read -r -p "Type YES to confirm: " CONFIRM
 
 if [[ $CONFIRM != "YES" ]]; then
@@ -25,6 +27,15 @@ if [[ $CONFIRM != "YES" ]]; then
 fi
 
 echo "[INFO] Reset starting: $(date)"
+
+# WAN failover daemon: stop first, it reads the settings folder
+systemctl stop wan-failover 2>/dev/null || true
+systemctl disable wan-failover 2>/dev/null || true
+if [[ -f $FAILOVER_UNIT ]]; then
+    rm -f "$FAILOVER_UNIT"
+    echo "[INFO] Removed wan-failover service"
+fi
+systemctl daemon-reload 2>/dev/null || true
 
 # Settings folder
 if [[ -d $SETTINGS_DIR ]]; then
@@ -53,9 +64,9 @@ if [[ -f $DHCPD_CONF ]]; then
     echo "[INFO] Removed static-hosts include from $DHCPD_CONF"
 fi
 
-# Remove the soloroute cronjob, its script was just deleted
-crontab -l 2>/dev/null | grep -v -F "soloroute.sh" | crontab - || true
-echo "[INFO] Removed soloroute.sh cronjob (if present)"
+# Remove the old cronjobs, their scripts were just deleted
+crontab -l 2>/dev/null | grep -v -F -e "soloroute.sh" -e "dhcp-routes.sh" | crontab - || true
+echo "[INFO] Removed soloroute.sh and dhcp-routes.sh cronjobs (if present)"
 
 # Start firstrun.sh
 if [[ -f $FIRSTRUN ]]; then

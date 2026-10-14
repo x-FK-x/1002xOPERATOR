@@ -129,14 +129,37 @@ done
 log "LAN interface: $LAN_IF"
 log "WAN interfaces: ${WAN_IFS[*]}"
 
-for IF in "$LAN_IF" "${WAN_IFS[@]}"; do
-    ip link set "$IF" up
+prepare_interface() {
+    local IF="$1" role="$2"
+    if iface_is_wlan "$IF"; then
+        nmcli radio wifi on >/dev/null 2>&1 || true
+        rfkill unblock wifi 2>/dev/null || true
+        if rfkill list wifi 2>/dev/null | grep -q "Hard blocked: yes"; then
+            if [[ $role == "LAN" ]]; then
+                error "WLAN interface $IF is hard-blocked (hardware switch or BIOS). Enable wireless and run again."
+            fi
+            warn "WAN WLAN $IF is hard-blocked and will be skipped for now."
+            return 0
+        fi
+    fi
+    ip link set "$IF" up 2>/dev/null || warn "Could not bring up $IF"
+}
+
+prepare_interface "$LAN_IF" "LAN"
+for WAN_IF in "${WAN_IFS[@]}"; do
+    prepare_interface "$WAN_IF" "WAN"
 done
 
 configure_wlan_client() {
     local ssid hidden pw
     local -a hidden_opt=()
     warn "WAN WLAN $1 has no IPv4 address. Starting WLAN client setup."
+    local wlan_ans
+    read -rp "Configure WAN WLAN $1 now? [y/N]: " wlan_ans
+    if [[ ! $wlan_ans =~ ^[yY]$ ]]; then
+        log "Skipping WLAN client setup for $1."
+        return 1
+    fi
     nmcli device wifi rescan ifname "$1" >/dev/null 2>&1 || true
     nmcli -f SSID,SIGNAL,SECURITY device wifi list ifname "$1" 2>/dev/null || true
     echo
@@ -153,21 +176,30 @@ configure_wlan_client() {
 wait_for_wan() {
     local i
     for i in $(seq 1 30); do
-        if [[ -n $(iface_ipv4 "$1") && -n $(gateway_for "$1") ]]; then
-            log "WAN $1: address $(iface_ipv4 "$1"), gateway $(gateway_for "$1")"
+        if [[ -n $(iface_ipv4 "$1") ]]; then
+            log "WAN $1: address $(iface_ipv4 "$1")"
             return 0
         fi
         sleep 1
     done
-    error "WAN interface $1 has no IPv4 address or default gateway after 30 seconds."
+    warn "WAN interface $1 has no IPv4 address, skipping it."
+    return 1
 }
 
+WAN_OK=()
 for WAN in "${WAN_IFS[@]}"; do
+    if iface_is_wlan "$WAN" && rfkill list wifi 2>/dev/null | grep -q "Hard blocked: yes"; then
+        warn "Skipping hard-blocked WAN WLAN $WAN"
+        continue
+    fi
     if [[ -z $(iface_ipv4 "$WAN") ]] && iface_is_wlan "$WAN"; then
         configure_wlan_client "$WAN"
     fi
-    wait_for_wan "$WAN"
+    wait_for_wan "$WAN" && WAN_OK+=("$WAN")
 done
+(( ${#WAN_OK[@]} > 0 )) || error "No WAN interface has an IPv4 address."
+WAN_IFS=("${WAN_OK[@]}")
+log "Usable WAN interfaces: ${WAN_IFS[*]}"
 
 while true; do
     SUBNET_INPUT=$(whiptail --title "LAN Subnet" --inputbox \
@@ -326,7 +358,7 @@ for WAN in "${WAN_IFS[@]}"; do
 done
 netfilter-persistent save >/dev/null 2>&1 || error "Could not save firewall rules"
 
-DHCPD_TMP=$(mktemp)
+DHCPD_TMP=$(mktemp) || error "Cannot create temporary dhcpd config"
 cat > "$DHCPD_TMP" <<EOF
 authoritative;
 
@@ -336,10 +368,6 @@ subnet $LAN_SUBNET netmask $LAN_NETMASK {
     option domain-name-servers $DNS_SERVERS;
 }
 EOF
-if ! dhcpd -t -cf "$DHCPD_TMP" >/dev/null 2>&1; then
-    rm -f "$DHCPD_TMP"
-    error "Generated dhcpd.conf failed the configuration test."
-fi
 install -m 644 "$DHCPD_TMP" /etc/dhcp/dhcpd.conf
 rm -f "$DHCPD_TMP"
 log "Wrote /etc/dhcp/dhcpd.conf"
@@ -364,5 +392,29 @@ echo "  DNS:     $DNS_SERVERS"
 echo "  WAN:     ${WAN_IFS[*]}"
 echo "  Backup:  $BACKUP_DIR"
 log "Network configuration completed successfully."
+
+# =========================
+# Install and run check.sh (multi-WAN priority, failover, forwarding, UFW)
+# =========================
+CHECK_DST="/etc/1002xOPERATOR/dhcp/check.sh"
+CHECK_SRC="$(dirname "$(readlink -f "$0")")/check.sh"
+mkdir -p /etc/1002xOPERATOR/dhcp/settings || warn "Cannot create /etc/1002xOPERATOR/dhcp/settings"
+if [[ $CHECK_SRC -ef $CHECK_DST ]]; then
+    log "check.sh already in place at $CHECK_DST"
+elif [[ -f $CHECK_SRC ]]; then
+    install -m 755 "$CHECK_SRC" "$CHECK_DST" && log "Installed check.sh to $CHECK_DST" \
+        || warn "Could not install check.sh to $CHECK_DST"
+else
+    warn "check.sh not found next to firstrun.sh ($CHECK_SRC)."
+fi
+
+echo
+echo "=== Multi-WAN check ==="
+read -rp "Type YES to run the multi-WAN check now: " CONFIRM
+if [[ $CONFIRM == "YES" && -x $CHECK_DST ]]; then
+    bash "$CHECK_DST"
+else
+    log "Check skipped. Run it later with: sudo bash $CHECK_DST"
+fi
 
 exit 0

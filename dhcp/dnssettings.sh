@@ -128,7 +128,12 @@ while true; do
         NEW_DOMAIN=$(ask_value "Enter new DNS domain:" "$CURRENT_DOMAIN" valid_domain) || continue
         if whiptail --title "Confirm Domain change" --yesno "Do you want to set DNS domain to: $NEW_DOMAIN ?" 10 60; then
             backup_conf
-            if write_config "s|^([[:space:]]*option domain-name )\".*\";|\1\"${NEW_DOMAIN}\";|"; then
+            if grep -qE '^[[:space:]]*option domain-name "' "$DHCP_CONF"; then
+                DOMAIN_EXPR="s|^([[:space:]]*option domain-name )\".*\";|\1\"${NEW_DOMAIN}\";|"
+            else
+                DOMAIN_EXPR="/^[[:space:]]*option domain-name-servers /a\\    option domain-name \"${NEW_DOMAIN}\";"
+            fi
+            if write_config "$DOMAIN_EXPR"; then
                 echo "[INFO] DNS domain updated to $NEW_DOMAIN"
             else
                 echo "[ERROR] Domain change failed, previous configuration restored"
