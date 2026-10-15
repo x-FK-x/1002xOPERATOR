@@ -7,7 +7,6 @@ PRIORITY_FILE="$FOLDERSETTINGS/wan-priority.list"
 FAILOVER_SCRIPT="$FOLDERSETTINGS/wan-failover.sh"
 FAILOVER_STATE="$FOLDERSETTINGS/wan-failover.state"
 FAILOVER_LOG="/var/log/wan-failover.log"
-SYSCTL_DROPIN="/etc/sysctl.d/99-1002xoperator.conf"
 
 PING_TARGETS=("8.8.8.8" "1.1.1.1" "9.9.9.9")
 PING_COUNT=4
@@ -17,6 +16,9 @@ log()  { echo "[INFO] $1"; }
 warn() { echo "[WARN] $1"; }
 ask()  { read -rp "[QUESTION] $1 [y/N]: " reply; [[ "$reply" =~ ^[Yy]$ ]]; }
 
+# -------------------------------------------------
+# CLEANUP: reset all previous configuration
+# -------------------------------------------------
 log "Cleaning up previous configuration..."
 
 systemctl stop wan-failover 2>/dev/null || true
@@ -30,7 +32,7 @@ rm -f "$FOLDERSETTINGS/wan-failover.sh"
 log "Cleanup complete."
 
 log "Detecting network interfaces..."
-mapfile -t INTERFACES < <(ip -o link show | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -vx 'lo')
+mapfile -t INTERFACES < <(ip -o link show | awk -F': ' '{print $2}' | grep -v lo)
 
 LAN_INTERFACE=$(grep -E '^INTERFACESv4=' "$DHCP_CONFIG" | cut -d'"' -f2)
 [[ -z "$LAN_INTERFACE" ]] && { log "No LAN interface defined in DHCP config."; exit 1; }
@@ -86,8 +88,8 @@ if (( ${#ACTIVE_WAN[@]} > 1 )); then
         echo "  2) Metric-based only, kernel picks lowest metric active route"
         read -rp "Select mode [1/2] (default: 1): " FAILOVER_MODE_INPUT
         case "$FAILOVER_MODE_INPUT" in
-            2) FAILOVER_MODE="metric" ;;
-            *) FAILOVER_MODE="active" ;;
+            2) FAILOVER_MODE="1" ;;
+            *) FAILOVER_MODE="2" ;;
         esac
 
         DHCP_SCRIPT="$FOLDERSETTINGS/dhcp-routes.sh"
@@ -140,9 +142,10 @@ ROUTEEOF
         chmod +x "$DHCP_SCRIPT"
         log "Route fixer created at $DHCP_SCRIPT"
 
-        if [[ "$FAILOVER_MODE" == "active" ]]; then
+        if [[ "$FAILOVER_MODE" == "2" ]]; then
 cat > "$FAILOVER_SCRIPT" <<'FAILEOF'
 #!/bin/bash
+# wan-failover.sh: Active WAN Failover (ifdown/ifup + ping check, every 30s)
 
 PRIORITY_FILE="/etc/1002xOPERATOR/dhcp/settings/wan-priority.list"
 STATIC_ROUTES_FILE="/etc/1002xOPERATOR/dhcp/settings/static-routes.conf"
@@ -152,8 +155,9 @@ LOGFILE="/var/log/wan-failover.log"
 PING_TARGETS=("8.8.8.8" "1.1.1.1" "9.9.9.9")
 PING_COUNT=4
 PING_TIMEOUT=10
+
+
 TEST_TABLE_BASE=1000
-CHECK_INTERVAL=30
 
 log_fo() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOGFILE"; }
 
@@ -173,11 +177,13 @@ _iface_table_id() {
 _TEST_wan_via_temp_rule() {
     local iface="$1"
     local gw="$2"
-    local tid src_ip result=1
+    local tid
     tid=$(_iface_table_id "$iface")
 
+    local src_ip
     src_ip=$(ip -4 addr show dev "$iface" | awk '/inet/ {print $2}' | cut -d/ -f1 | head -n1)
-    [[ -z "$src_ip" ]] && { log_fo "TEST [$iface] no source IP for temp rule"; return 1; }
+    [[ -z "$src_ip" ]] && { log_fo "TEST [$iface] NO src-IP for temp-rule"; return 1; }
+
 
     ip rule del from "$src_ip" table "$tid" 2>/dev/null || true
     ip route flush table "$tid" 2>/dev/null || true
@@ -187,24 +193,29 @@ _TEST_wan_via_temp_rule() {
     ip rule add from "$src_ip" table "$tid" priority "$((tid * 10))" 2>/dev/null \
         || { ip route flush table "$tid" 2>/dev/null; log_fo "TEST [$iface] ip rule add failed"; return 1; }
 
-    log_fo "TEST [$iface] temp policy active: src=$src_ip -> table $tid via $gw"
+    log_fo "TEST [$iface] Temp-Policy active: src=$src_ip â†’ table $tid via $gw"
 
+    local result=1
+
+    
     if ping -c 2 -W "$PING_TIMEOUT" -I "$iface" "$gw" &>/dev/null; then
-        log_fo "TEST [$iface] gateway $gw reachable, interface online"
+        log_fo "TEST [$iface] Gateway $gw is reachable, Interface is online"
         result=0
     else
-        log_fo "TEST [$iface] gateway $gw not reachable"
+        log_fo "TEST [$iface] Gateway $gw is not reachable, Interface stays suppressed"
     fi
 
+    # Temp-Policy removed
     ip rule del from "$src_ip" table "$tid" priority "$((tid * 10))" 2>/dev/null \
         && log_fo "TEST [$iface] ip rule removed" \
-        || log_fo "TEST [$iface] WARNING: ip rule could not be removed"
+        || log_fo "TEST [$iface] WARNUNG: ip rule can't removed"
     ip route flush table "$tid" 2>/dev/null \
-        && log_fo "TEST [$iface] temp route removed" \
-        || log_fo "TEST [$iface] WARNING: temp route could not be removed"
+        && log_fo "TEST [$iface] Temp-Route removed" \
+        || log_fo "TEST [$iface] WARNUNG: Temp-Route can't removed"
 
     return $result
 }
+
 
 check_wan() {
     local iface="$1"
@@ -215,55 +226,16 @@ check_wan() {
     local gw
     gw=$(ip route show dev "$iface" | awk '/default/ {print $3}' | head -n1)
     [[ -z "$gw" ]] && gw=$(grep "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null | awk '{print $3}' | head -n1)
-    [[ -z "$gw" ]] && { log_fo "[$iface] no gateway for check"; return 1; }
-    ping -c 1 -W "$PING_TIMEOUT" -I "$iface" "$gw" &>/dev/null || { log_fo "[$iface] gateway $gw not reachable"; return 1; }
+    [[ -z "$gw" ]] && { log_fo "[$iface] No Gateway for check_wan"; return 1; }
+    ping -c 1 -W "$PING_TIMEOUT" -I "$iface" "$gw" &>/dev/null || { log_fo "[$iface] Gateway $gw not reachable"; return 1; }
     local ok=0
     for target in "${PING_TARGETS[@]}"; do
         ping -c "$PING_COUNT" -W "$PING_TIMEOUT" -I "$iface" "$target" &>/dev/null && ok=1 && break
     done
-    [[ "$ok" -eq 1 ]] || { log_fo "[$iface] no internet connectivity"; return 1; }
+    [[ "$ok" -eq 1 ]] || { log_fo "[$iface] No internet activity"; return 1; }
     return 0
 }
 
-drop_default_routes() {
-    local iface="$1" route via mt
-    local -a args
-    while IFS= read -r route; do
-        via=$(echo "$route" | awk '{print $3}')
-        mt=$(echo "$route" | awk '/metric/{for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
-        if [[ -n "$via" ]]; then
-            args=(default via "$via" dev "$iface")
-        else
-            args=(default dev "$iface")
-        fi
-        [[ -n "$mt" ]] && args+=(metric "$mt")
-        ip route del "${args[@]}" 2>/dev/null || true
-    done < <(ip route show default dev "$iface")
-}
-
-clear_cooldown() {
-    grep -v "^COOLDOWN $1 " "$STATE_FILE" > "$STATE_FILE.tmp" 2>/dev/null || true
-    mv "$STATE_FILE.tmp" "$STATE_FILE"
-}
-
-fail_restore() {
-    local iface="$1" current="$2" reason="$3" next_ts
-    if (( current == 0 )); then
-        current=30
-    else
-        current=$(( current * 2 ))
-    fi
-    (( current > 600 )) && current=600
-    next_ts=$(( $(date +%s) + current ))
-
-    grep -v "^COOLDOWN $iface " "$STATE_FILE" > "$STATE_FILE.tmp" 2>/dev/null || true
-    echo "COOLDOWN $iface $next_ts $current" >> "$STATE_FILE.tmp"
-    mv "$STATE_FILE.tmp" "$STATE_FILE"
-
-    drop_default_routes "$iface"
-    ifdown "$iface" >/dev/null 2>&1 || ip link set "$iface" down 2>/dev/null || true
-    log_fo "RESTORE: [$iface] failed ($reason), interface set down again. Next test in ${current}s at $(date -d "@$next_ts" '+%H:%M:%S')"
-}
 
 suppress_interface() {
     local iface="$1"
@@ -276,81 +248,119 @@ suppress_interface() {
     [[ -z "$metric" ]] && metric=100
 
     echo "SUPPRESSED $iface $gw $metric" >> "$STATE_FILE"
-    log_fo "SUPPRESS: stopping $iface via ifdown (was via $gw metric $metric)"
+    log_fo "SUPPRESS: Stop $iface via ifdown (was via $gw metric $metric)"
 
     ifdown "$iface" 2>/dev/null \
-        && log_fo "SUPPRESS: ifdown $iface successful" \
+        && log_fo "SUPPRESS: ifdown $iface successfully" \
         || {
-            log_fo "SUPPRESS: ifdown $iface failed, removing route manually"
+            log_fo "SUPPRESS: ifdown $iface failed, remove Route manually"
             ip route del default via "$gw" dev "$iface" metric "$metric" 2>/dev/null || true
         }
 }
 
+
 restore_interface() {
     local iface="$1"
-    local entry saved_gw saved_metric cooldown_entry next_allowed current_cooldown now remaining live_ip live_gw gw i
-
+    local entry
     entry=$(grep "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null | head -n1)
     [[ -z "$entry" ]] && return 0
 
-    saved_gw=$(echo "$entry" | awk '{print $3}')
+    local saved_gw saved_metric
+    saved_gw=$(echo "$entry"     | awk '{print $3}')
     saved_metric=$(echo "$entry" | awk '{print $4}')
-    [[ -z "$saved_metric" ]] && saved_metric=100
 
-    now=$(date +%s)
-    current_cooldown=0
+    log_fo "RESTORE: Restart $iface via ifup..."
+    ifup "$iface" 2>/dev/null \
+        && log_fo "RESTORE: ifup $iface successfully" \
+        || log_fo "RESTORE: ifup $iface failed, try to test anyway"
+
+    sleep 4
+
+
+    local live_ip
+    live_ip=$(ip -4 addr show dev "$iface" | awk '/inet/ {print $2}' | cut -d/ -f1 | head -n1)
+    if [[ -z "$live_ip" ]]; then
+        log_fo "RESTORE: $iface has after ifup no IP, stays suppressed (no Route-Add)"
+        return 1
+    fi
+
+    # Gateway ermitteln
+    local live_gw
+    live_gw=$(ip route show dev "$iface" | awk '/default/ {print $3}' | head -n1)
+    local gw="${live_gw:-$saved_gw}"
+
+    if [[ -z "$gw" ]]; then
+        log_fo "RESTORE: No Gateway for $iface, stays suppressed (no Route-ADD)"
+        return 1
+    fi
+
+
+    local cooldown_entry next_allowed current_cooldown now
     cooldown_entry=$(grep "^COOLDOWN $iface " "$STATE_FILE" 2>/dev/null | head -n1)
+    now=$(date +%s)
+
     if [[ -n "$cooldown_entry" ]]; then
         next_allowed=$(echo "$cooldown_entry" | awk '{print $3}')
         current_cooldown=$(echo "$cooldown_entry" | awk '{print $4}')
         if (( now < next_allowed )); then
-            remaining=$(( next_allowed - now ))
+            local remaining=$(( next_allowed - now ))
+            log_fo "RESTORE: [$iface] Cooldown active – ${remaining}s remaining until next test"
             return 1
         fi
-        log_fo "RESTORE: [$iface] cooldown expired (was ${current_cooldown}s), starting test"
+        log_fo "RESTORE: [$iface] Cooldown expired (was ${current_cooldown}s), starting TEST-Ping..."
+    else
+        current_cooldown=0
     fi
 
-    log_fo "RESTORE: [$iface] bringing interface up for test"
-    ifup "$iface" >/dev/null 2>&1 || log_fo "RESTORE: [$iface] ifup reported an error"
-
-    live_ip=""
-    for i in $(seq 1 15); do
-        live_ip=$(ip -4 addr show dev "$iface" | awk '/inet/ {print $2}' | cut -d/ -f1 | head -n1)
-        [[ -n "$live_ip" ]] && break
-        sleep 1
-    done
-    if [[ -z "$live_ip" ]]; then
-        fail_restore "$iface" "$current_cooldown" "no IPv4 address after ifup"
-        return 1
-    fi
-
-    sleep 2
-    live_gw=$(ip route show default dev "$iface" | awk '{print $3; exit}')
-    gw="${live_gw:-$saved_gw}"
-    drop_default_routes "$iface"
-
-    if [[ -z "$gw" ]]; then
-        fail_restore "$iface" "$current_cooldown" "no gateway available"
-        return 1
-    fi
-
-    log_fo "RESTORE: [$iface] testing gateway $gw via temporary policy route (no global default route)"
+    log_fo "RESTORE: Start TEST-Ping for $iface via $gw (NO global Default-Route)"
     if ! _TEST_wan_via_temp_rule "$iface" "$gw"; then
-        fail_restore "$iface" "$current_cooldown" "gateway test failed"
+        log_fo "RESTORE: $iface TEST failed, add NO Default-Route, stays suppressed"
+
+
+        if (( current_cooldown == 0 )); then
+            current_cooldown=30
+        else
+            current_cooldown=$(( current_cooldown * 2 ))
+        fi
+        (( current_cooldown > 4800 )) && current_cooldown=4800
+        local next_ts=$(( now + current_cooldown ))
+
+        # Alten Cooldown-Eintrag ersetzen
+        grep -v "^COOLDOWN $iface " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
+        echo "COOLDOWN $iface $next_ts $current_cooldown" >> "${STATE_FILE}.tmp"
+        mv "${STATE_FILE}.tmp" "$STATE_FILE"
+        log_fo "RESTORE: [$iface] Cooldown set to ${current_cooldown}s (next attempt at: $(date -d @$next_ts '+%H:%M:%S'))"
+
+        while IFS= read -r route; do
+            local via mt
+            via=$(echo "$route" | awk '{print $3}')
+            mt=$(echo "$route" | awk '/metric/{for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
+            [[ -z "$via" ]] && continue
+            ip route del default via "$via" dev "$iface" ${mt:+metric $mt} 2>/dev/null && \
+                log_fo "RESTORE: Undesirables Route removed: via $via dev $iface ${mt:+metric $mt}" || true
+        done < <(ip route show default dev "$iface")
         return 1
     fi
 
-    clear_cooldown "$iface"
-    ip route replace default via "$gw" dev "$iface" metric "$saved_metric" 2>/dev/null \
-        && log_fo "RESTORE: [$iface] default route set via $gw metric $saved_metric" \
-        || log_fo "RESTORE: [$iface] WARNING: could not set default route via $gw"
+    grep -v "^COOLDOWN $iface " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
+    mv "${STATE_FILE}.tmp" "$STATE_FILE"
+    log_fo "RESTORE: [$iface] TEST successful, cooldown reset"
 
-    grep -v "^SUPPRESSED $iface " "$STATE_FILE" > "$STATE_FILE.tmp" 2>/dev/null || true
-    mv "$STATE_FILE.tmp" "$STATE_FILE"
-    log_fo "RESTORE: [$iface] restored and removed from suppressed state"
+
+    log_fo "RESTORE: TEST successfully, ADD Default-Route via $gw dev $iface metric $saved_metric"
+    ip route replace default via "$gw" dev "$iface" metric "$saved_metric" 2>/dev/null \
+        && log_fo "RESTORE: Default-Route was set" \
+        || log_fo "RESTORE: WARNUNG: Default-Route can't set (via $gw dev $iface metric $saved_metric)"
+
+    grep -v "^SUPPRESSED $iface " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
+    mv "${STATE_FILE}.tmp" "$STATE_FILE"
+    log_fo "RESTORE: $iface was successfully restored and from STATE removed"
     return 0
 }
 
+# ------------------------------------------------------------------
+# suspend_static_routes / restore_static_routes
+# ------------------------------------------------------------------
 suspend_static_routes() {
     local failed_iface="$1"
     [[ ! -f "$STATIC_ROUTES_FILE" ]] && return
@@ -387,6 +397,9 @@ restore_static_routes() {
     fi
 }
 
+# ------------------------------------------------------------------
+# ensure_iptables: NAT & FORWARD Regeln sicherstellen
+# ------------------------------------------------------------------
 ensure_iptables() {
     local lan_if
     lan_if=$(grep -E '^INTERFACESv4=' /etc/default/isc-dhcp-server 2>/dev/null | cut -d'"' -f2)
@@ -398,24 +411,27 @@ ensure_iptables() {
         ip link show "$iface" &>/dev/null || continue
         if ! iptables -t nat -C POSTROUTING -o "$iface" -j MASQUERADE &>/dev/null; then
             iptables -t nat -A POSTROUTING -o "$iface" -j MASQUERADE
-            log_fo "[iptables] restored: NAT MASQUERADE for $iface"
+            log_fo "[iptables] RESTORED: NAT MASQUERADE rule for $iface"
             changed=1
         fi
         if ! iptables -C FORWARD -i "$lan_if" -o "$iface" -j ACCEPT &>/dev/null; then
             iptables -A FORWARD -i "$lan_if" -o "$iface" -j ACCEPT
-            log_fo "[iptables] restored: FORWARD $lan_if -> $iface"
+            log_fo "[iptables] RESTORED: FORWARD $lan_if -> $iface"
             changed=1
         fi
-        if ! iptables -C FORWARD -i "$iface" -o "$lan_if" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT &>/dev/null; then
-            iptables -A FORWARD -i "$iface" -o "$lan_if" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-            log_fo "[iptables] restored: FORWARD $iface -> $lan_if (RELATED,ESTABLISHED)"
+        if ! iptables -C FORWARD -i "$iface" -o "$lan_if" -m state --state RELATED,ESTABLISHED -j ACCEPT &>/dev/null; then
+            iptables -A FORWARD -i "$iface" -o "$lan_if" -m state --state RELATED,ESTABLISHED -j ACCEPT
+            log_fo "[iptables] RESTORED: FORWARD $iface -> $lan_if (RELATED,ESTABLISHED)"
             changed=1
         fi
     done
-    [[ "$changed" -eq 0 ]] && log_fo "[iptables] all rules OK"
+    [[ "$changed" -eq 0 ]] && log_fo "[iptables] All rules OK"
 }
 
-log_fo "=== WAN failover daemon started ==="
+# ------------------------------------------------------------------
+# Startup
+# ------------------------------------------------------------------
+log_fo "=== WAN Failover daemon started ==="
 touch "$STATE_FILE"
 ensure_iptables
 
@@ -424,10 +440,13 @@ SOLO_ROUTES_SCRIPT="/etc/1002xOPERATOR/dhcp/settings/soloroute.sh"
 [[ -x "$DHCP_ROUTES_SCRIPT" ]] && bash "$DHCP_ROUTES_SCRIPT"
 [[ -x "$SOLO_ROUTES_SCRIPT" ]]  && bash "$SOLO_ROUTES_SCRIPT"
 
+# ------------------------------------------------------------------
+# Hauptschleife
+# ------------------------------------------------------------------
 while true; do
     if [[ ! -f "$PRIORITY_FILE" ]]; then
-        log_fo "no priority file found, waiting..."
-        sleep "$CHECK_INTERVAL"
+        log_fo "No priority file found, waiting..."
+        sleep 30
         continue
     fi
 
@@ -441,10 +460,11 @@ while true; do
         grep -q "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null && IS_SUPPRESSED=1
 
         if [[ "$IS_SUPPRESSED" -eq 1 ]]; then
+            log_fo "[$iface] is suppressed, try ifup + TEST-Ping..."
             restore_interface "$iface" && restore_static_routes "$iface"
         else
             if ! check_wan "$iface"; then
-                log_fo "$iface is down or unreachable, suppressing via ifdown"
+                log_fo "$iface is DOWN or not reachable, suppress via ifdown"
                 suppress_interface "$iface"
                 suspend_static_routes "$iface"
             fi
@@ -454,7 +474,7 @@ while true; do
     [[ -x "$DHCP_ROUTES_SCRIPT" ]] && bash "$DHCP_ROUTES_SCRIPT"
     [[ -x "$SOLO_ROUTES_SCRIPT" ]]  && bash "$SOLO_ROUTES_SCRIPT"
     ensure_iptables
-    sleep "$CHECK_INTERVAL"
+    sleep 30
 done
 FAILEOF
 
@@ -491,6 +511,7 @@ SVCEOF
             log "Metric-based routing only, no active failover daemon installed."
         fi
 
+        # Remove any leftover cronjob
         if crontab -l 2>/dev/null | grep -qF "$DHCP_SCRIPT"; then
             crontab -l 2>/dev/null | grep -vF "$DHCP_SCRIPT" | crontab -
             log "Removed legacy cronjob for dhcp-routes.sh"
@@ -502,20 +523,26 @@ fi
 
 log "Multi-WAN configuration complete!"
 
+# -------------------------------------------------
+# Check IPv4 forwarding
+# -------------------------------------------------
 log "Checking IP forwarding status..."
-touch "$SYSCTL_DROPIN"
 if [[ "$(sysctl -n net.ipv4.ip_forward)" -eq 1 ]]; then
     log "IP forwarding is already enabled."
 else
     log "IP forwarding is disabled. Enabling..."
-    grep -qxF "net.ipv4.ip_forward=1" "$SYSCTL_DROPIN" || echo "net.ipv4.ip_forward=1" >> "$SYSCTL_DROPIN"
+    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
     sysctl -w net.ipv4.ip_forward=1
+    sysctl --system
     log "IP forwarding enabled."
 fi
 
+# -------------------------------------------------
+# Check RP filters
+# -------------------------------------------------
 if [[ "$(sysctl -n net.ipv4.conf.all.rp_filter)" -ne 0 ]]; then
     log "RP filter (all) is enabled. Disabling..."
-    grep -qxF "net.ipv4.conf.all.rp_filter=0" "$SYSCTL_DROPIN" || echo "net.ipv4.conf.all.rp_filter=0" >> "$SYSCTL_DROPIN"
+    echo "net.ipv4.conf.all.rp_filter=0" >> /etc/sysctl.conf
     sysctl -w net.ipv4.conf.all.rp_filter=0
     log "RP filter (all) disabled."
 else
@@ -524,13 +551,16 @@ fi
 
 if [[ "$(sysctl -n net.ipv4.conf.default.rp_filter)" -ne 0 ]]; then
     log "RP filter (default) is enabled. Disabling..."
-    grep -qxF "net.ipv4.conf.default.rp_filter=0" "$SYSCTL_DROPIN" || echo "net.ipv4.conf.default.rp_filter=0" >> "$SYSCTL_DROPIN"
+    echo "net.ipv4.conf.default.rp_filter=0" >> /etc/sysctl.conf
     sysctl -w net.ipv4.conf.default.rp_filter=0
     log "RP filter (default) disabled."
 else
     log "RP filter (default) already disabled."
 fi
 
+# -------------------------------------------------
+# Check NAT & FORWARD rules (IPv4 only)
+# -------------------------------------------------
 log "Checking iptables for NAT & FORWARD rules..."
 IPTABLES_CHANGED=0
 for iface in "${ACTIVE_WAN[@]}"; do
@@ -544,8 +574,8 @@ for iface in "${ACTIVE_WAN[@]}"; do
         IPTABLES_CHANGED=1; log "FORWARD rule LAN -> $iface added."
     else log "FORWARD rule LAN -> $iface already exists."; fi
 
-    if ! iptables -C FORWARD -i "$iface" -o "$LAN_INTERFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT &>/dev/null; then
-        iptables -A FORWARD -i "$iface" -o "$LAN_INTERFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    if ! iptables -C FORWARD -i "$iface" -o "$LAN_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT &>/dev/null; then
+        iptables -A FORWARD -i "$iface" -o "$LAN_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
         IPTABLES_CHANGED=1; log "FORWARD rule WAN -> LAN added for $iface."
     else log "FORWARD rule WAN -> LAN already exists for $iface."; fi
 done
@@ -563,6 +593,9 @@ if [[ "$IPTABLES_CHANGED" -eq 1 ]]; then
     fi
 fi
 
+# -------------------------------------------------
+# Optional UFW check
+# -------------------------------------------------
 if command -v ufw &>/dev/null; then
     log "UFW is installed."
     if ufw status | grep -q "Status: active"; then
@@ -570,14 +603,14 @@ if command -v ufw &>/dev/null; then
 
         UFW_VERBOSE=$(ufw status verbose 2>/dev/null)
         if ! echo "$UFW_VERBOSE" | grep -q "Default:.*allow.*routed"; then
-            log "UFW: default routed policy is not 'allow', forwarding may be blocked."
+            log "UFW: Default routed policy is not 'allow', forwarding may be blocked."
             UFW_PROBLEM=1
         else
-            log "UFW: default routed policy is already 'allow'."
+            log "UFW: Default routed policy is already 'allow'."
         fi
 
         if ! echo "$UFW_VERBOSE" | grep -q "on $LAN_INTERFACE"; then
-            log "UFW: no ALLOW IN rule for LAN interface $LAN_INTERFACE."
+            log "UFW: No ALLOW IN rule for LAN interface $LAN_INTERFACE."
             UFW_PROBLEM=1
         else
             log "UFW: ALLOW IN rule for $LAN_INTERFACE already exists."
@@ -594,6 +627,9 @@ if command -v ufw &>/dev/null; then
     else log "UFW is installed but not active."; fi
 else log "UFW is not installed."; fi
 
+# -------------------------------------------------
+# Final verification
+# -------------------------------------------------
 log "Verifying LAN configuration..."
 log "LAN interface $LAN_INTERFACE has IP: $LAN_IP"
 log "Verifying WAN configuration..."
