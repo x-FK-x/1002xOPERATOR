@@ -28,7 +28,6 @@ systemctl daemon-reload 2>/dev/null || true
 
 rm -f "$FOLDERSETTINGS/dhcp-routes.sh"
 rm -f "$FOLDERSETTINGS/wan-failover.sh"
-rm -f "$FOLDERSETTINGS"/fail-*.cnt 2>/dev/null || true
 
 log "Cleanup complete."
 
@@ -44,7 +43,12 @@ log "Using LAN interface from DHCP config: $LAN_INTERFACE with IP $LAN_IP"
 
 WAN_INTERFACES=()
 for iface in "${INTERFACES[@]}"; do
-    [[ "$iface" != "$LAN_INTERFACE" ]] && WAN_INTERFACES+=("$iface")
+    [[ "$iface" == "$LAN_INTERFACE" ]] && continue
+    if [[ -d "/sys/class/net/$iface/wireless" || "$iface" == wl* ]]; then
+        log "Skipping $iface, wireless interfaces are never used as WAN"
+        continue
+    fi
+    WAN_INTERFACES+=("$iface")
 done
 
 ACTIVE_WAN=()
@@ -89,51 +93,71 @@ if (( ${#ACTIVE_WAN[@]} > 1 )); then
         echo "  2) Metric-based only, kernel picks lowest metric active route"
         read -rp "Select mode [1/2] (default: 1): " FAILOVER_MODE_INPUT
         case "$FAILOVER_MODE_INPUT" in
-            2) FAILOVER_MODE="1" ;;
-            *) FAILOVER_MODE="2" ;;
+            2) FAILOVER_MODE="2" ;;
+            *) FAILOVER_MODE="1" ;;
         esac
 
         DHCP_SCRIPT="$FOLDERSETTINGS/dhcp-routes.sh"
 cat > "$DHCP_SCRIPT" <<'ROUTEEOF'
 #!/bin/bash
 PRIORITY_FILE="/etc/1002xOPERATOR/dhcp/settings/wan-priority.list"
-STATE_FILE="/etc/1002xOPERATOR/dhcp/settings/wan-failover.state"
 LOGFILE="/var/log/wan-failover.log"
 log_r() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [route-fixer] $1" | tee -a "$LOGFILE"; }
 [[ ! -f "$PRIORITY_FILE" ]] && log_r "Priority file not found." && exit 0
 LAST_LINE=$(tail -n1 "$PRIORITY_FILE")
 read -ra WAN_IFACES <<< "$LAST_LINE"
-[[ ${#WAN_IFACES[@]} -eq 0 ]] && log_r "No valid interfaces." && exit 0
-log_r "Processing: ${WAN_IFACES[*]}"
-
+VALID_IFACES=()
+for entry in "${WAN_IFACES[@]}"; do
+    ip link show "$entry" &>/dev/null && VALID_IFACES+=("$entry") || log_r "Skipping invalid: '$entry'"
+done
+[[ ${#VALID_IFACES[@]} -eq 0 ]] && log_r "No valid interfaces." && exit 0
+log_r "Processing: ${VALID_IFACES[*]}"
+STATE_FILE="/etc/1002xOPERATOR/dhcp/settings/wan-failover.state"
 METRIC=100
-for iface in "${WAN_IFACES[@]}"; do
-    CUR_METRIC=$METRIC
-    METRIC=$((METRIC + 100))
-
-    ip link show "$iface" &>/dev/null || { log_r "Skipping invalid: '$iface'"; continue; }
-    grep -q "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null && { log_r "$iface suppressed, skipping."; continue; }
-    ip link show "$iface" | grep -q "state UP" || { log_r "$iface DOWN, skipping."; continue; }
-
+for iface in "${VALID_IFACES[@]}"; do
+    grep -q "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null && { log_r "$iface suppressed, skipping route fix."; METRIC=$((METRIC + 100)); continue; }
+    ip link show "$iface" | grep -q "state UP" || { log_r "$iface DOWN, skipping."; METRIC=$((METRIC + 100)); continue; }
     GW=$(ip route show dev "$iface" | awk '/default/ {print $3}' | head -n1)
     if [[ -z "$GW" ]]; then
         GW=$(nmcli -g IP4.GATEWAY device show "$iface" 2>/dev/null | head -n1)
         [[ -z "$GW" ]] && GW=$(ip route show dev "$iface" | awk '/via/ {print $3}' | head -n1)
     fi
-    [[ -z "$GW" ]] && { log_r "No gateway found for $iface, skipping."; continue; }
-
-    # Remove every default route on this interface, then set the one with the fixed metric
-    while ip route show default dev "$iface" | grep -q .; do
-        ip route del default dev "$iface" 2>/dev/null || break
-    done
-    ip route replace default via "$GW" dev "$iface" metric "$CUR_METRIC"
-    log_r "Set default via $GW dev $iface metric $CUR_METRIC"
+    [[ -z "$GW" ]] && { log_r "No gateway found for $iface, skipping."; METRIC=$((METRIC + 100)); continue; }
+    cur=$(ip route show default dev "$iface")
+    if [[ "$(grep -c . <<< "$cur")" -eq 1 ]]; then
+        cur_via=$(awk '{print $3}' <<< "$cur")
+        cur_mt=$(awk '{for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}' <<< "$cur")
+        if [[ "$cur_via" == "$GW" && "${cur_mt:-0}" == "$METRIC" ]]; then
+            METRIC=$((METRIC + 100))
+            continue
+        fi
+    fi
+    ip route replace default via "$GW" dev "$iface" metric "$METRIC" \
+        && log_r "Set default via $GW dev $iface metric $METRIC" \
+        || log_r "WARNING: could not set default via $GW dev $iface metric $METRIC"
+    while IFS= read -r route; do
+        via=$(echo "$route" | awk '{print $3}')
+        mt=$(echo "$route" | awk '/metric/{for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
+        [[ -z "$via" ]] && continue
+        [[ "$via" == "$GW" && "${mt:-0}" == "$METRIC" ]] && continue
+        ip route delete default via "$via" dev "$iface" ${mt:+metric $mt} 2>/dev/null && \
+            log_r "Removed stale default via $via dev $iface ${mt:+metric $mt}" || true
+    done < <(ip route show default dev "$iface")
+    METRIC=$((METRIC + 100))
 done
 ROUTEEOF
         chmod +x "$DHCP_SCRIPT"
         log "Route fixer created at $DHCP_SCRIPT"
 
-        if [[ "$FAILOVER_MODE" == "2" ]]; then
+        if [[ "$FAILOVER_MODE" == "1" ]]; then
+            if ! command -v conntrack &>/dev/null; then
+                log "Installing conntrack (needed for NAT session cleanup on failback)..."
+                DEBIAN_FRONTEND=noninteractive apt-get install -y conntrack \
+                    && log "conntrack installed." \
+                    || warn "conntrack install failed, stale NAT sessions will only expire by timeout"
+            else
+                log "conntrack already installed."
+            fi
 cat > "$FAILOVER_SCRIPT" <<'FAILEOF'
 #!/bin/bash
 # wan-failover.sh: Active WAN Failover (ifdown/ifup + ping check, every 30s)
@@ -142,12 +166,15 @@ PRIORITY_FILE="/etc/1002xOPERATOR/dhcp/settings/wan-priority.list"
 STATIC_ROUTES_FILE="/etc/1002xOPERATOR/dhcp/settings/static-routes.conf"
 SUSPENDED_ROUTES_FILE="/etc/1002xOPERATOR/dhcp/settings/static-routes.suspended"
 STATE_FILE="/etc/1002xOPERATOR/dhcp/settings/wan-failover.state"
-FAIL_DIR="/etc/1002xOPERATOR/dhcp/settings"
 LOGFILE="/var/log/wan-failover.log"
 PING_TARGETS=("8.8.8.8" "1.1.1.1" "9.9.9.9")
 PING_COUNT=4
 PING_TIMEOUT=10
-FAIL_THRESHOLD=3
+FAIL_THRESHOLD=3          # consecutive failed checks before suppress
+LOSS_MAX=20               # max packet loss in % before a check counts as failed
+RESTORE_LOSS_MAX=5        # max packet loss in % for a restore test to count as ok
+RESTORE_STABLE_TESTS=3    # consecutive ok tests required before failback
+FAIL_DIR="/etc/1002xOPERATOR/dhcp/settings"
 
 TEST_TABLE_BASE=1000
 
@@ -176,6 +203,7 @@ _TEST_wan_via_temp_rule() {
     src_ip=$(ip -4 addr show dev "$iface" | awk '/inet/ {print $2}' | cut -d/ -f1 | head -n1)
     [[ -z "$src_ip" ]] && { log_fo "TEST [$iface] NO src-IP for temp-rule"; return 1; }
 
+
     ip rule del from "$src_ip" table "$tid" 2>/dev/null || true
     ip route flush table "$tid" 2>/dev/null || true
 
@@ -186,23 +214,38 @@ _TEST_wan_via_temp_rule() {
 
     log_fo "TEST [$iface] Temp-Policy active: src=$src_ip table $tid via $gw"
 
-    local result=1
+    local result=1 loss target
+    loss=$(_ping_loss "$iface" "$gw")
+    (( loss > 0 )) && log_fo "TEST [$iface] NOTICE: Gateway $gw packet loss ${loss}%"
+    for target in "${PING_TARGETS[@]}"; do
+        loss=$(_ping_loss "$iface" "$target")
+        if (( loss <= RESTORE_LOSS_MAX )); then
+            log_fo "TEST [$iface] $target OK (loss ${loss}%), Interface is online"
+            result=0
+            break
+        fi
+        log_fo "TEST [$iface] $target packet loss ${loss}% (max ${RESTORE_LOSS_MAX}%)"
+    done
+    (( result == 0 )) || log_fo "TEST [$iface] No internet target reachable, Interface stays suppressed"
 
-    if ping -c 2 -W "$PING_TIMEOUT" -I "$iface" "$gw" &>/dev/null; then
-        log_fo "TEST [$iface] Gateway $gw is reachable, Interface is online"
-        result=0
-    else
-        log_fo "TEST [$iface] Gateway $gw is not reachable, Interface stays suppressed"
-    fi
-
+    # Temp-Policy removed
     ip rule del from "$src_ip" table "$tid" priority "$((tid * 10))" 2>/dev/null \
         && log_fo "TEST [$iface] ip rule removed" \
         || log_fo "TEST [$iface] WARNING: ip rule could not be removed"
     ip route flush table "$tid" 2>/dev/null \
         && log_fo "TEST [$iface] Temp-Route removed" \
-        || log_fo "TEST [$iface] WARNING: Temp-Route could not be removed"
+        || log_fo "TEST [$iface] WARNING: temp route could not be removed"
 
     return $result
+}
+
+
+# _ping_loss <iface> <target>: prints packet loss in % (100 if ping fails)
+_ping_loss() {
+    local out loss
+    out=$(ping -c 10 -i 0.2 -W 2 -q -I "$1" "$2" 2>/dev/null)
+    loss=$(awk '/packet loss/ {for(i=1;i<=NF;i++) if($i ~ /%$/) {sub(/%/,"",$i); print int($i)}}' <<< "$out")
+    echo "${loss:-100}"
 }
 
 check_wan() {
@@ -214,15 +257,27 @@ check_wan() {
     local gw
     gw=$(ip route show dev "$iface" | awk '/default/ {print $3}' | head -n1)
     [[ -z "$gw" ]] && gw=$(grep "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null | awk '{print $3}' | head -n1)
-    [[ -z "$gw" ]] && { log_fo "[$iface] No gateway for check_wan"; return 1; }
-    ping -c 3 -W "$PING_TIMEOUT" -I "$iface" "$gw" &>/dev/null || { log_fo "[$iface] Gateway $gw not reachable"; return 1; }
-    local ok=0
+    [[ -z "$gw" ]] && { log_fo "[$iface] No Gateway for check_wan"; return 1; }
+
+    local loss target ok=0
+    # Gateway ICMP is informational only: routers often answer it on a slow path while
+    # forwarding is fine. A WAN is judged by loss to the internet targets.
+    loss=$(_ping_loss "$iface" "$gw")
+    (( loss > 0 )) && log_fo "[$iface] NOTICE: Gateway $gw packet loss ${loss}%"
+
     for target in "${PING_TARGETS[@]}"; do
-        ping -c "$PING_COUNT" -W "$PING_TIMEOUT" -I "$iface" "$target" &>/dev/null && ok=1 && break
+        loss=$(_ping_loss "$iface" "$target")
+        if (( loss <= LOSS_MAX )); then
+            (( loss > 0 )) && log_fo "[$iface] NOTICE: $target packet loss ${loss}%"
+            ok=1
+            break
+        fi
+        log_fo "[$iface] $target packet loss ${loss}% (max ${LOSS_MAX}%)"
     done
     [[ "$ok" -eq 1 ]] || { log_fo "[$iface] No internet activity"; return 1; }
     return 0
 }
+
 
 suppress_interface() {
     local iface="$1"
@@ -239,7 +294,31 @@ suppress_interface() {
 
     ifdown "$iface" 2>/dev/null \
         && log_fo "SUPPRESS: ifdown $iface successfully" \
-        || log_fo "SUPPRESS: ifdown $iface failed, route left unchanged"
+        || {
+            log_fo "SUPPRESS: ifdown $iface failed, remove Route manually"
+            ip route del default via "$gw" dev "$iface" metric "$metric" 2>/dev/null || true
+        }
+}
+
+
+# flush_stale_nat <iface> <metric>: after <iface> becomes preferred, drop NAT sessions
+# still bound to the IP of a worse-metric WAN (they would leave with the wrong source IP)
+flush_stale_nat() {
+    local iface="$1" metric="$2" line dev mt wan_ip
+    if ! command -v conntrack &>/dev/null; then
+        log_fo "NAT: conntrack not installed, stale sessions stay until timeout (apt install conntrack)"
+        return 0
+    fi
+    while IFS= read -r line; do
+        dev=$(awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' <<< "$line")
+        mt=$(awk '{for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}' <<< "$line")
+        [[ -z "$dev" || "$dev" == "$iface" ]] && continue
+        (( ${mt:-0} > metric )) || continue
+        wan_ip=$(ip -4 addr show dev "$dev" | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
+        [[ -z "$wan_ip" ]] && continue
+        conntrack -D -q "$wan_ip" &>/dev/null
+        log_fo "NAT: flushed sessions bound to $wan_ip ($dev), they re-map via $iface"
+    done < <(ip route show default)
 }
 
 restore_interface() {
@@ -252,29 +331,6 @@ restore_interface() {
     saved_gw=$(echo "$entry"     | awk '{print $3}')
     saved_metric=$(echo "$entry" | awk '{print $4}')
 
-    log_fo "RESTORE: Restart $iface via ifup..."
-    ifup "$iface" 2>/dev/null \
-        && log_fo "RESTORE: ifup $iface successfully" \
-        || log_fo "RESTORE: ifup $iface failed, try to test anyway"
-
-    sleep 4
-
-    local live_ip
-    live_ip=$(ip -4 addr show dev "$iface" | awk '/inet/ {print $2}' | cut -d/ -f1 | head -n1)
-    if [[ -z "$live_ip" ]]; then
-        log_fo "RESTORE: $iface has no IP after ifup, stays suppressed (no route add)"
-        return 1
-    fi
-
-    local live_gw
-    live_gw=$(ip route show dev "$iface" | awk '/default/ {print $3}' | head -n1)
-    local gw="${live_gw:-$saved_gw}"
-
-    if [[ -z "$gw" ]]; then
-        log_fo "RESTORE: No gateway for $iface, stays suppressed (no route add)"
-        return 1
-    fi
-
     local cooldown_entry next_allowed current_cooldown now
     cooldown_entry=$(grep "^COOLDOWN $iface " "$STATE_FILE" 2>/dev/null | head -n1)
     now=$(date +%s)
@@ -284,45 +340,109 @@ restore_interface() {
         current_cooldown=$(echo "$cooldown_entry" | awk '{print $4}')
         if (( now < next_allowed )); then
             local remaining=$(( next_allowed - now ))
-            log_fo "RESTORE: [$iface] Cooldown active - ${remaining}s remaining until next test"
+            log_fo "RESTORE: [$iface] Cooldown active – ${remaining}s remaining until next test"
             return 1
         fi
-        log_fo "RESTORE: [$iface] Cooldown expired (was ${current_cooldown}s), starting TEST ping..."
+        log_fo "RESTORE: [$iface] Cooldown expired (was ${current_cooldown}s), starting TEST-Ping..."
     else
         current_cooldown=0
     fi
 
-    log_fo "RESTORE: Start TEST ping for $iface via $gw (NO global default route)"
+    log_fo "RESTORE: Restart $iface via ifup..."
+    ifup "$iface" 2>/dev/null \
+        && log_fo "RESTORE: ifup $iface successfully" \
+        || log_fo "RESTORE: ifup $iface failed, try to test anyway"
+
+    # ifup/dhclient installs its own default route (usually metric 0, i.e. better than the
+    # active WAN). Remember its gateway, then drop the route at once: the WAN under test
+    # must never compete with the active one, the test uses its own temp table.
+    local live_gw route via mt
+    live_gw=$(ip route show default dev "$iface" | awk '{print $3}' | head -n1)
+    while IFS= read -r route; do
+        via=$(echo "$route" | awk '{print $3}')
+        mt=$(echo "$route" | awk '/metric/{for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
+        [[ -z "$via" ]] && continue
+        ip route del default via "$via" dev "$iface" ${mt:+metric $mt} 2>/dev/null && \
+            log_fo "RESTORE: [$iface] removed ifup default route via $via ${mt:+metric $mt} (WAN under test)" || true
+    done < <(ip route show default dev "$iface")
+
+    sleep 4
+
+
+    local live_ip
+    live_ip=$(ip -4 addr show dev "$iface" | awk '/inet/ {print $2}' | cut -d/ -f1 | head -n1)
+    if [[ -z "$live_ip" ]]; then
+        log_fo "RESTORE: $iface has after ifup no IP, stays suppressed (no Route-Add)"
+        return 1
+    fi
+
+    # Determine gateway (live_gw was captured right after ifup)
+    local gw="${live_gw:-$saved_gw}"
+
+    if [[ -z "$gw" ]]; then
+        log_fo "RESTORE: No Gateway for $iface, stays suppressed (no Route-ADD)"
+        return 1
+    fi
+
+
+    log_fo "RESTORE: Start TEST-Ping for $iface via $gw (NO global Default-Route)"
     if ! _TEST_wan_via_temp_rule "$iface" "$gw"; then
-        log_fo "RESTORE: $iface TEST failed, no default route added, stays suppressed"
+        log_fo "RESTORE: $iface TEST failed, add NO Default-Route, stays suppressed"
+        rm -f "$FAIL_DIR/ok-$iface.cnt"
+
 
         if (( current_cooldown == 0 )); then
             current_cooldown=30
         else
             current_cooldown=$(( current_cooldown * 2 ))
         fi
-        (( current_cooldown > 4800 )) && current_cooldown=4800
+        (( current_cooldown > 1800 )) && current_cooldown=1800
         local next_ts=$(( now + current_cooldown ))
 
+        # Replace old cooldown entry
         grep -v "^COOLDOWN $iface " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
         echo "COOLDOWN $iface $next_ts $current_cooldown" >> "${STATE_FILE}.tmp"
         mv "${STATE_FILE}.tmp" "$STATE_FILE"
         log_fo "RESTORE: [$iface] Cooldown set to ${current_cooldown}s (next attempt at: $(date -d @$next_ts '+%H:%M:%S'))"
+
+        ifdown "$iface" 2>/dev/null \
+            && log_fo "RESTORE: [$iface] ifdown after failed test (route removed)" \
+            || log_fo "RESTORE: [$iface] WARNING: ifdown after failed test failed"
+
+        while IFS= read -r route; do
+            local via mt
+            via=$(echo "$route" | awk '{print $3}')
+            mt=$(echo "$route" | awk '/metric/{for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
+            [[ -z "$via" ]] && continue
+            ip route del default via "$via" dev "$iface" ${mt:+metric $mt} 2>/dev/null && \
+                log_fo "RESTORE: Unwanted route removed: via $via dev $iface ${mt:+metric $mt}" || true
+        done < <(ip route show default dev "$iface")
         return 1
     fi
 
+    local ok_file="$FAIL_DIR/ok-$iface.cnt" ok_n
+    ok_n=$(( $(cat "$ok_file" 2>/dev/null || echo 0) + 1 ))
+    if (( ok_n < RESTORE_STABLE_TESTS )); then
+        echo "$ok_n" > "$ok_file"
+        log_fo "RESTORE: [$iface] TEST ok ($ok_n/$RESTORE_STABLE_TESTS), waiting for stability, no route added"
+        return 1
+    fi
+    rm -f "$ok_file"
+
     grep -v "^COOLDOWN $iface " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
     mv "${STATE_FILE}.tmp" "$STATE_FILE"
-    log_fo "RESTORE: [$iface] TEST successful, cooldown reset"
+    log_fo "RESTORE: [$iface] TEST successful ($RESTORE_STABLE_TESTS/$RESTORE_STABLE_TESTS), cooldown reset"
 
-    log_fo "RESTORE: TEST successful, adding default route via $gw dev $iface metric $saved_metric"
+
+    log_fo "RESTORE: TEST successfully, ADD Default-Route via $gw dev $iface metric $saved_metric"
     ip route replace default via "$gw" dev "$iface" metric "$saved_metric" 2>/dev/null \
-        && log_fo "RESTORE: Default route set" \
+        && log_fo "RESTORE: Default-Route was set" \
         || log_fo "RESTORE: WARNING: default route could not be set (via $gw dev $iface metric $saved_metric)"
+    flush_stale_nat "$iface" "$saved_metric"
 
     grep -v "^SUPPRESSED $iface " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
     mv "${STATE_FILE}.tmp" "$STATE_FILE"
-    log_fo "RESTORE: $iface successfully restored and removed from state"
+    log_fo "RESTORE: $iface was successfully restored and from STATE removed"
     return 0
 }
 
@@ -421,26 +541,29 @@ while true; do
     LAST_LINE=$(tail -n1 "$PRIORITY_FILE")
     read -ra WAN_IFACES <<< "$LAST_LINE"
 
+    ANY_FAIL=0
     for iface in "${WAN_IFACES[@]}"; do
         ip link show "$iface" &>/dev/null || continue
 
         IS_SUPPRESSED=0
         grep -q "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null && IS_SUPPRESSED=1
-        FAIL_FILE="$FAIL_DIR/fail-$iface.cnt"
 
         if [[ "$IS_SUPPRESSED" -eq 1 ]]; then
-            log_fo "[$iface] is suppressed, trying ifup + TEST ping..."
+            log_fo "[$iface] is suppressed, try ifup + TEST-Ping..."
             restore_interface "$iface" && restore_static_routes "$iface"
         else
+            FAIL_FILE="$FAIL_DIR/fail-$iface.cnt"
             if ! check_wan "$iface"; then
                 n=$(( $(cat "$FAIL_FILE" 2>/dev/null || echo 0) + 1 ))
                 echo "$n" > "$FAIL_FILE"
                 log_fo "[$iface] check failed ($n/$FAIL_THRESHOLD)"
                 if (( n >= FAIL_THRESHOLD )); then
-                    log_fo "$iface: $n consecutive failures, suppressing"
+                    log_fo "$iface: $n consecutive failures, suppress via ifdown"
                     suppress_interface "$iface"
                     suspend_static_routes "$iface"
                     rm -f "$FAIL_FILE"
+                else
+                    ANY_FAIL=1
                 fi
             else
                 rm -f "$FAIL_FILE"
@@ -451,7 +574,7 @@ while true; do
     [[ -x "$DHCP_ROUTES_SCRIPT" ]] && bash "$DHCP_ROUTES_SCRIPT"
     [[ -x "$SOLO_ROUTES_SCRIPT" ]]  && bash "$SOLO_ROUTES_SCRIPT"
     ensure_iptables
-    sleep 30
+    sleep $(( ANY_FAIL ? 5 : 30 ))
 done
 FAILEOF
 
@@ -616,3 +739,4 @@ for iface in "${ACTIVE_WAN[@]}"; do
     log "WAN interface $iface IP: $IP  Gateway: ${GW:-none}"
 done
 log "Network and iptables configuration is complete and verified."
+
