@@ -292,12 +292,24 @@ suppress_interface() {
     echo "SUPPRESSED $iface $gw $metric" >> "$STATE_FILE"
     log_fo "SUPPRESS: Stop $iface via ifdown (was via $gw metric $metric)"
 
+    # Existing NAT sessions still carry the failed WAN's IP as source. Once traffic
+    # leaves via the backup they are dropped upstream until conntrack times out, which
+    # is what makes Teams hang and reconnect. Capture the IP before ifdown removes it,
+    # then drop those sessions so clients re-map at once.
+    local wan_ip
+    wan_ip=$(ip -4 addr show dev "$iface" | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1)
+
     ifdown "$iface" 2>/dev/null \
         && log_fo "SUPPRESS: ifdown $iface successfully" \
         || {
             log_fo "SUPPRESS: ifdown $iface failed, remove Route manually"
             ip route del default via "$gw" dev "$iface" metric "$metric" 2>/dev/null || true
         }
+
+    if [[ -n "$wan_ip" ]] && command -v conntrack &>/dev/null; then
+        conntrack -D -q "$wan_ip" &>/dev/null \
+            && log_fo "NAT: flushed sessions bound to $wan_ip ($iface) on suppress, clients re-map via backup"
+    fi
 }
 
 

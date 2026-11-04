@@ -92,6 +92,7 @@ command -v nmcli                >/dev/null || NEED_PKGS+=(network-manager)
 command -v whiptail             >/dev/null || NEED_PKGS+=(whiptail)
 command -v dhcpd                >/dev/null || NEED_PKGS+=(isc-dhcp-server)
 command -v netfilter-persistent >/dev/null || NEED_PKGS+=(iptables-persistent)
+command -v dhclient             >/dev/null || NEED_PKGS+=(isc-dhcp-client)
 command -v ifup                 >/dev/null || NEED_PKGS+=(ifupdown)
 
 if (( ${#NEED_PKGS[@]} > 0 )); then
@@ -145,11 +146,6 @@ prepare_interface() {
     ip link set "$IF" up 2>/dev/null || warn "Could not bring up $IF"
 }
 
-prepare_interface "$LAN_IF" "LAN"
-for WAN_IF in "${WAN_IFS[@]}"; do
-    prepare_interface "$WAN_IF" "WAN"
-done
-
 configure_wlan_client() {
     local ssid hidden pw
     local -a hidden_opt=()
@@ -173,29 +169,68 @@ configure_wlan_client() {
         || error "Could not connect $1 to '$ssid'."
 }
 
-wait_for_wan() {
-    local i
-    for i in $(seq 1 30); do
-        if [[ -n $(iface_ipv4 "$1") ]]; then
-            log "WAN $1: address $(iface_ipv4 "$1")"
-            return 0
-        fi
-        sleep 1
+SKIPPED_WAN=()
+is_skipped() {
+    local x
+    for x in "${SKIPPED_WAN[@]:-}"; do
+        [[ $x == "$1" ]] && return 0
     done
-    warn "WAN interface $1 has no IPv4 address, skipping it."
     return 1
 }
 
-WAN_OK=()
+# Waits up to $2 seconds for a link (carrier) on interface $1
+wait_carrier() {
+    local i
+    for i in $(seq 1 "$2"); do
+        [[ $(cat "/sys/class/net/$1/carrier" 2>/dev/null) == "1" ]] && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# Requests an address via dhclient (one attempt, 20 s timeout)
+request_dhcp() {
+    command -v dhclient >/dev/null || { warn "dhclient not available, cannot request an address for $1."; return 1; }
+    log "WAN $1 has no IPv4 address, requesting one via dhclient..."
+    dhclient -1 -timeout 20 "$1" >/dev/null 2>&1 || true
+    [[ -n $(iface_ipv4 "$1") ]]
+}
+
+# --- Step 1: ask for all WAN WLANs right after the LAN interface is chosen ---
+prepare_interface "$LAN_IF" "LAN"
 for WAN in "${WAN_IFS[@]}"; do
-    if iface_is_wlan "$WAN" && rfkill list wifi 2>/dev/null | grep -q "Hard blocked: yes"; then
+    prepare_interface "$WAN" "WAN"
+done
+
+for WAN in "${WAN_IFS[@]}"; do
+    iface_is_wlan "$WAN" || continue
+    if rfkill list wifi 2>/dev/null | grep -q "Hard blocked: yes"; then
         warn "Skipping hard-blocked WAN WLAN $WAN"
+        SKIPPED_WAN+=("$WAN")
         continue
     fi
-    if [[ -z $(iface_ipv4 "$WAN") ]] && iface_is_wlan "$WAN"; then
-        configure_wlan_client "$WAN"
+    if [[ -z $(iface_ipv4 "$WAN") ]]; then
+        configure_wlan_client "$WAN" || SKIPPED_WAN+=("$WAN")
     fi
-    wait_for_wan "$WAN" && WAN_OK+=("$WAN")
+done
+
+# --- Step 2: WAN interfaces without an address get one via dhclient ---
+WAN_OK=()
+for WAN in "${WAN_IFS[@]}"; do
+    is_skipped "$WAN" && continue
+    if [[ -z $(iface_ipv4 "$WAN") ]]; then
+        if ! wait_carrier "$WAN" 5; then
+            warn "WAN interface $WAN has no link, skipping it."
+            continue
+        fi
+        request_dhcp "$WAN" || true
+    fi
+    if [[ -n $(iface_ipv4 "$WAN") ]]; then
+        log "WAN $WAN: address $(iface_ipv4 "$WAN")"
+        WAN_OK+=("$WAN")
+    else
+        warn "WAN interface $WAN has no IPv4 address, skipping it."
+    fi
 done
 (( ${#WAN_OK[@]} > 0 )) || error "No WAN interface has an IPv4 address."
 WAN_IFS=("${WAN_OK[@]}")
