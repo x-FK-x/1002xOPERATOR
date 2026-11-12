@@ -51,6 +51,30 @@ for iface in "${WAN_INTERFACES[@]}"; do
     IP=$(ip -o -4 addr show "$iface" 2>/dev/null | awk 'NR==1 {print $4}' | cut -d/ -f1)
     if [[ -z "$IP" ]]; then log "Skipping $iface, no IPv4 address assigned"; continue; fi
     GW=$(ip route show dev "$iface" | awk '/default/ {print $3}' | head -n1)
+    if [[ -z "$GW" ]]; then
+        log "WAN $iface has IP $IP but no gateway, attempting recovery..."
+        # 1) static gateway from /etc/network/interfaces (or interfaces.d)
+        GW=$(awk -v i="$iface" '/^[[:space:]]*iface[[:space:]]/{on=($2==i)} on && /^[[:space:]]*gateway[[:space:]]/{print $2; exit}' \
+            /etc/network/interfaces /etc/network/interfaces.d/* 2>/dev/null)
+        # 2) otherwise request a DHCP lease once and read its gateway
+        if [[ -z "$GW" ]]; then
+            timeout 30 dhclient -1 "$iface" &>/dev/null
+            GW=$(ip route show dev "$iface" | awk '/default/ {print $3}' | head -n1)
+            [[ -z "$GW" ]] && GW=$(awk -v i="$iface" '
+                /^lease *\{/ {ci=""; cg=""}
+                /interface "/ {ci=$0; gsub(/.*interface "|".*/, "", ci)}
+                /option routers/ {cg=$3; gsub(/;/, "", cg)}
+                /^\}/ {if (ci==i && cg!="") last=cg}
+                END {print last}' /var/lib/dhcp/dhclient*.leases 2>/dev/null)
+        fi
+        if [[ -n "$GW" ]]; then
+            ip route replace default via "$GW" dev "$iface" metric 100 2>/dev/null \
+                && log "Recovered default route for $iface via $GW" \
+                || warn "Could not set default route for $iface via $GW"
+        else
+            warn "No gateway found for $iface (no static gateway, no DHCP lease)"
+        fi
+    fi
     log "Detected WAN interface: $iface with IP $IP and Gateway ${GW:-none}"
     ACTIVE_WAN+=("$iface")
 done
@@ -106,36 +130,36 @@ for entry in "${WAN_IFACES[@]}"; do
     ip link show "$entry" &>/dev/null && VALID_IFACES+=("$entry") || log_r "Skipping invalid: '$entry'"
 done
 [[ ${#VALID_IFACES[@]} -eq 0 ]] && log_r "No valid interfaces." && exit 0
-log_r "Processing: ${VALID_IFACES[*]}"
 STATE_FILE="/etc/1002xOPERATOR/dhcp/settings/wan-failover.state"
 METRIC=100
 for iface in "${VALID_IFACES[@]}"; do
-    grep -q "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null && { log_r "$iface suppressed, skipping route fix."; METRIC=$((METRIC + 100)); continue; }
-    ip link show "$iface" | grep -q "state UP" || { log_r "$iface DOWN, skipping."; continue; }
+    # silent: suppressed, down, or no gateway are handled by the failover daemon itself
+    grep -q "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null && { METRIC=$((METRIC + 100)); continue; }
+    ip link show "$iface" | grep -q "state UP" || continue
     GW=$(ip route show dev "$iface" | awk '/default/ {print $3}' | head -n1)
     if [[ -z "$GW" ]]; then
         GW=$(nmcli -g IP4.GATEWAY device show "$iface" 2>/dev/null | head -n1)
         [[ -z "$GW" ]] && GW=$(ip route show dev "$iface" | awk '/via/ {print $3}' | head -n1)
     fi
-    [[ -z "$GW" ]] && log_r "No gateway found for $iface, skipping." && continue
+    [[ -z "$GW" ]] && continue
+
+    # already correct (exactly one default, right gateway, right metric): do nothing, log nothing
+    cur=$(ip route show default dev "$iface")
+    if [[ $(grep -c . <<< "$cur") -eq 1 ]] && [[ "$(awk '{print $3}' <<< "$cur")" == "$GW" ]] \
+        && grep -qE "metric $METRIC( |$)" <<< "$cur"; then
+        METRIC=$((METRIC + 100)); continue
+    fi
+
+    # correction needed: set the right route first (no gap), then drop the others
+    ip route replace default via "$GW" dev "$iface" metric "$METRIC" 2>/dev/null
     while IFS= read -r route; do
         via=$(echo "$route" | awk '{print $3}')
         mt=$(echo "$route" | awk '/metric/{for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
         [[ -z "$via" ]] && continue
         [[ "$via" == "$GW" && "${mt:-0}" == "$METRIC" ]] && continue
-        ip route delete default via "$via" dev "$iface" ${mt:+metric $mt} 2>/dev/null && \
-            log_r "Removed duplicate default via $via dev $iface ${mt:+metric $mt}" || true
+        ip route delete default via "$via" dev "$iface" ${mt:+metric $mt} 2>/dev/null
     done < <(ip route show default dev "$iface")
-    ip route replace default via "$GW" dev "$iface" metric "$METRIC"
-    log_r "Set default via $GW dev $iface metric $METRIC"
-    while IFS= read -r route; do
-        via=$(echo "$route" | awk '{print $3}')
-        mt=$(echo "$route" | awk '/metric/{for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
-        [[ -z "$via" ]] && continue
-        [[ "$via" == "$GW" && "${mt:-0}" == "$METRIC" ]] && continue
-        ip route delete default via "$via" dev "$iface" ${mt:+metric $mt} 2>/dev/null && \
-            log_r "Removed stale default via $via dev $iface ${mt:+metric $mt}" || true
-    done < <(ip route show default dev "$iface")
+    log_r "Corrected default route on $iface: via $GW metric $METRIC"
     METRIC=$((METRIC + 100))
 done
 ROUTEEOF
@@ -231,6 +255,7 @@ check_wan() {
     gw=$(ip route show dev "$iface" | awk '/default/ {print $3}' | head -n1)
     [[ -z "$gw" ]] && gw=$(grep "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null | awk '{print $3}' | head -n1)
     [[ -z "$gw" ]] && { log_fo "[$iface] No Gateway for check_wan"; return 1; }
+    echo "$gw" > "$FAIL_DIR/gw-$iface"
     # Gateway ICMP is informational only (routers may deprioritise pings to themselves).
     # The WAN is judged by loss to the internet targets.
     local ok=0 loss target
@@ -246,6 +271,46 @@ check_wan() {
 }
 
 
+# no gateway known for $1: request a DHCP lease (at most every 120s), then look again
+dhcp_gw_try(){
+    local now last
+    now=$(date +%s); last=$(cat "$FAIL_DIR/try-$1" 2>/dev/null); last=${last:-0}
+    if (( now - last >= 120 )); then
+        echo "$now" > "$FAIL_DIR/try-$1"
+        log_fo "[$1] no gateway known, requesting DHCP lease (dhclient -1)"
+        timeout 30 dhclient -1 "$1" &>/dev/null
+    fi
+    gw_known "$1"
+}
+
+# gateway from the DHCP lease (dhclient), for the interface given as $1
+lease_gw(){
+    awk -v i="$1" '
+        /^lease *\{/ {ci=""; cg=""}
+        /interface "/ {ci=$0; gsub(/.*interface "|".*/, "", ci)}
+        /option routers/ {cg=$3; gsub(/;/, "", cg)}
+        /^\}/ {if (ci==i && cg!="") last=cg}
+        END {print last}' /var/lib/dhcp/dhclient*.leases 2>/dev/null
+}
+
+# gateway from a static stanza in /etc/network/interfaces(.d), for the interface given as $1
+static_gw(){
+    awk -v i="$1" '
+        /^[[:space:]]*iface[[:space:]]/ {on = ($2 == i)}
+        on && /^[[:space:]]*gateway[[:space:]]/ {print $2; exit}
+    ' /etc/network/interfaces /etc/network/interfaces.d/* 2>/dev/null
+}
+
+# best known gateway: live route, last remembered one, static config, DHCP lease
+gw_known(){
+    local g
+    g=$(ip -4 route show default dev "$1" 2>/dev/null | awk '/via/{print $3; exit}')
+    [[ -z "$g" ]] && g=$(cat "$FAIL_DIR/gw-$1" 2>/dev/null)
+    [[ -z "$g" ]] && g=$(static_gw "$1")
+    [[ -z "$g" ]] && g=$(lease_gw "$1")
+    echo "$g"
+}
+
 suppress_interface() {
     local iface="$1"
     grep -q "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null && return 0
@@ -253,6 +318,8 @@ suppress_interface() {
     local route_info gw metric
     route_info=$(ip route show default dev "$iface" | head -n1)
     gw=$(echo "$route_info" | awk '{print $3}')
+    [[ -z "$gw" && -f "$FAIL_DIR/gw-$iface" ]] && gw=$(cat "$FAIL_DIR/gw-$iface")
+    [[ -z "$gw" ]] && { log_fo "SUPPRESS: [$iface] no gateway known, not suspending"; return 0; }
     metric=$(echo "$route_info" | awk '/metric/ {for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
     [[ -z "$metric" ]] && metric=100
 
@@ -287,6 +354,7 @@ restore_interface() {
     local saved_gw saved_metric
     saved_gw=$(echo "$entry"     | awk '{print $3}')
     saved_metric=$(echo "$entry" | awk '{print $4}')
+    saved_metric=${saved_metric:-100}
 
     local cooldown_entry next_allowed current_cooldown now
     cooldown_entry=$(grep "^COOLDOWN $iface " "$STATE_FILE" 2>/dev/null | head -n1)
@@ -305,10 +373,12 @@ restore_interface() {
         current_cooldown=0
     fi
 
+    local ifup_ran=0
     if ip -4 addr show dev "$iface" | grep -q "inet "; then
         log_fo "RESTORE: [$iface] already has an address, interface is not touched"
     else
         log_fo "RESTORE: [$iface] has no address, ifup $iface..."
+        ifup_ran=1
         ifup "$iface" 2>/dev/null \
             && log_fo "RESTORE: ifup $iface successfully" \
             || log_fo "RESTORE: ifup $iface failed, try to test anyway"
@@ -318,14 +388,16 @@ restore_interface() {
     # Remove it at once: the WAN under test must not carry traffic before it passed.
     local ifup_gw
     ifup_gw=$(ip route show default dev "$iface" | awk '{print $3}' | head -n1)
-    while IFS= read -r route; do
-        local via mt
-        via=$(echo "$route" | awk '{print $3}')
-        mt=$(echo "$route" | awk '/metric/{for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
-        [[ -z "$via" ]] && continue
-        ip route del default via "$via" dev "$iface" ${mt:+metric $mt} 2>/dev/null && \
-            log_fo "RESTORE: [$iface] removed ifup default route via $via ${mt:+metric $mt} (WAN under test)" || true
-    done < <(ip route show default dev "$iface")
+    if (( ifup_ran )); then
+        while IFS= read -r route; do
+            local via mt
+            via=$(echo "$route" | awk '{print $3}')
+            mt=$(echo "$route" | awk '/metric/{for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
+            [[ -z "$via" ]] && continue
+            ip route del default via "$via" dev "$iface" ${mt:+metric $mt} 2>/dev/null && \
+                log_fo "RESTORE: [$iface] removed ifup default route via $via ${mt:+metric $mt} (WAN under test)" || true
+        done < <(ip route show default dev "$iface")
+    fi
 
     sleep 4
 
@@ -384,9 +456,18 @@ restore_interface() {
 
 
     log_fo "RESTORE: TEST successfully, ADD Default-Route via $gw dev $iface metric $saved_metric"
-    ip route replace default via "$gw" dev "$iface" metric "$saved_metric" 2>/dev/null \
-        && log_fo "RESTORE: Default-Route was set" \
-        || log_fo "RESTORE: WARNUNG: Default-Route can't set (via $gw dev $iface metric $saved_metric)"
+    if ! ip route replace default via "$gw" dev "$iface" metric "$saved_metric" 2>/dev/null; then
+        # Fallback: bring the interface up (never down) so DHCP/ifupdown re-establishes it,
+        # then set the route again with the remembered gateway and metric.
+        log_fo "RESTORE: Default-Route can't be set (via $gw dev $iface metric $saved_metric), fallback ifup $iface"
+        ifup "$iface" 2>/dev/null
+        sleep 4
+        if ! ip route replace default via "$gw" dev "$iface" metric "$saved_metric" 2>/dev/null; then
+            log_fo "RESTORE: WARNING: Default-Route still can't be set after ifup, will retry"
+            return 1
+        fi
+    fi
+    log_fo "RESTORE: Default-Route was set"
 
     grep -v "^SUPPRESSED $iface " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
     mv "${STATE_FILE}.tmp" "$STATE_FILE"
@@ -479,6 +560,27 @@ SOLO_ROUTES_SCRIPT="/etc/1002xOPERATOR/dhcp/settings/soloroute.sh"
 # ------------------------------------------------------------------
 # Hauptschleife
 # ------------------------------------------------------------------
+# Startup: before the first check, restore default routes of WANs that have an address
+# but no route (e.g. after a reboot or a router restart), then start the loop.
+if [[ -f "$PRIORITY_FILE" ]]; then
+    for iface in $(tail -n1 "$PRIORITY_FILE"); do
+        ip link show "$iface" &>/dev/null || continue
+        if ip -4 route show default dev "$iface" | grep -q .; then
+            # already routed: stale SUPPRESSED/COOLDOWN entries from an earlier run must not keep it down
+            sed -i "/^SUPPRESSED $iface /d; /^COOLDOWN $iface /d" "$STATE_FILE" 2>/dev/null
+            log_fo "[$iface] startup: default route present, clearing stale state"
+            continue
+        fi
+        ip -4 -o addr show dev "$iface" scope global | grep -q inet || continue
+        gw_k=$(gw_known "$iface")
+        [[ -z "$gw_k" ]] && gw_k=$(dhcp_gw_try "$iface")
+        [[ -n "$gw_k" ]] || { log_fo "[$iface] startup: address but no gateway known"; continue; }
+        grep -q "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null || echo "SUPPRESSED $iface $gw_k 100" >> "$STATE_FILE"
+        log_fo "[$iface] startup: address but no default route, restoring via $gw_k"
+        restore_interface "$iface" && restore_static_routes "$iface"
+    done
+fi
+
 while true; do
     if [[ ! -f "$PRIORITY_FILE" ]]; then
         log_fo "No priority file found, waiting..."
@@ -499,6 +601,21 @@ while true; do
             log_fo "[$iface] is suppressed, try ifup + TEST-Ping..."
             restore_interface "$iface" && restore_static_routes "$iface"
         else
+            # Address but no default route (e.g. after a daemon restart or a lost route):
+            # hand the interface to the restore path, which tests and sets the route.
+            if ! ip -4 route show default dev "$iface" | grep -q . && \
+               ip -4 -o addr show dev "$iface" scope global | grep -q inet; then
+                gw_k=$(gw_known "$iface")
+                [[ -z "$gw_k" ]] && gw_k=$(dhcp_gw_try "$iface")
+                if [[ -n "$gw_k" ]]; then
+                    if ! grep -q "^SUPPRESSED $iface " "$STATE_FILE" 2>/dev/null; then
+                        echo "$gw_k" > "$FAIL_DIR/gw-$iface"
+                        echo "SUPPRESSED $iface $gw_k 100" >> "$STATE_FILE"
+                        log_fo "[$iface] has address but no default route, restoring via $gw_k"
+                    fi
+                    continue
+                fi
+            fi
             FAIL_FILE="$FAIL_DIR/fail-$iface.cnt"
             if ! check_wan "$iface"; then
                 n=$(( $(cat "$FAIL_FILE" 2>/dev/null || echo 0) + 1 ))
