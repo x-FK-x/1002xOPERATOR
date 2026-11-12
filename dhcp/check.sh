@@ -360,39 +360,50 @@ restore_interface() {
         current_cooldown=0
     fi
 
-    log_fo "RESTORE: Restart $iface via ifup..."
-    # A dhclient left over from an earlier, failed ifup blocks the next one.
-    # Clear it so each attempt starts clean.
-    pkill -f "dhclient.*$iface" 2>/dev/null || true
-    ifup "$iface" 2>/dev/null \
-        && log_fo "RESTORE: ifup $iface successfully" \
-        || log_fo "RESTORE: ifup $iface failed, waiting for lease anyway"
+    # Stability phase: the last test passed, the interface is already up and under test.
+    # Do NOT ifup again, that re-leases and re-adds the route on every cycle.
+    local live_gw=""
+    if [[ -f "$FAIL_DIR/ok-$iface.cnt" ]]; then
+        log_fo "RESTORE: [$iface] stability check running, no ifup this cycle"
+    else
+        log_fo "RESTORE: Restart $iface via ifup..."
+        # A dhclient left over from an earlier, failed ifup blocks the next one.
+        # Clear it so each attempt starts clean.
+        pkill -f "dhclient.*$iface" 2>/dev/null || true
+        # Drop stale addresses from earlier leases first. Otherwise the old and the new
+        # IP both stay on the NIC, and "first address" (NAT source, test source) is random.
+        ip -4 addr flush dev "$iface" 2>/dev/null || true
+        ifup "$iface" 2>/dev/null \
+            && log_fo "RESTORE: ifup $iface successfully" \
+            || log_fo "RESTORE: ifup $iface failed, waiting for lease anyway"
 
-    # DHCP after a router restart can take well over 4s. Wait for a lease (max 45s)
-    # instead of a fixed sleep.
-    local waited=0
-    while (( waited < 45 )); do
-        ip -4 addr show dev "$iface" | grep -q "inet " && break
-        sleep 3
-        waited=$(( waited + 3 ))
-    done
-    if ! ip -4 addr show dev "$iface" | grep -q "inet "; then
-        log_fo "RESTORE: $iface got no lease after ${waited}s, trying dhclient once"
-        timeout 20 dhclient -1 "$iface" &>/dev/null || true
+        # DHCP after a router restart can take well over 4s. Wait for a lease (max 45s)
+        # instead of a fixed sleep.
+        local waited=0
+        while (( waited < 45 )); do
+            ip -4 addr show dev "$iface" | grep -q "inet " && break
+            sleep 3
+            waited=$(( waited + 3 ))
+        done
+        if ! ip -4 addr show dev "$iface" | grep -q "inet "; then
+            log_fo "RESTORE: $iface got no lease after ${waited}s, trying dhclient once"
+            timeout 20 dhclient -1 "$iface" &>/dev/null || true
+        fi
+
+        # ifup/dhclient installs its own default route (usually metric 0, i.e. better than the
+        # active WAN). Remember its gateway, then drop the route at once: the WAN under test
+        # must never compete with the active one, the test uses its own temp table.
+        local live_gw route via mt
+        live_gw=$(ip route show default dev "$iface" | awk '{print $3}' | head -n1)
+        while IFS= read -r route; do
+            via=$(echo "$route" | awk '{print $3}')
+            mt=$(echo "$route" | awk '/metric/{for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
+            [[ -z "$via" ]] && continue
+            ip route del default via "$via" dev "$iface" ${mt:+metric $mt} 2>/dev/null && \
+                log_fo "RESTORE: [$iface] removed ifup default route via $via ${mt:+metric $mt} (WAN under test)" || true
+        done < <(ip route show default dev "$iface")
+
     fi
-
-    # ifup/dhclient installs its own default route (usually metric 0, i.e. better than the
-    # active WAN). Remember its gateway, then drop the route at once: the WAN under test
-    # must never compete with the active one, the test uses its own temp table.
-    local live_gw route via mt
-    live_gw=$(ip route show default dev "$iface" | awk '{print $3}' | head -n1)
-    while IFS= read -r route; do
-        via=$(echo "$route" | awk '{print $3}')
-        mt=$(echo "$route" | awk '/metric/{for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
-        [[ -z "$via" ]] && continue
-        ip route del default via "$via" dev "$iface" ${mt:+metric $mt} 2>/dev/null && \
-            log_fo "RESTORE: [$iface] removed ifup default route via $via ${mt:+metric $mt} (WAN under test)" || true
-    done < <(ip route show default dev "$iface")
 
     local live_ip
     live_ip=$(ip -4 addr show dev "$iface" | awk '/inet/ {print $2}' | cut -d/ -f1 | head -n1)
@@ -513,6 +524,27 @@ restore_static_routes() {
 # ------------------------------------------------------------------
 # ensure_iptables: make sure NAT and FORWARD rules exist
 # ------------------------------------------------------------------
+# normalize_wan_addrs <iface>: if a WAN carries several IPv4 addresses (leftovers from an
+# older lease or a static entry), keep the one the kernel uses as source for its default
+# route and remove the rest. Runs only on WANs that are up and not suppressed.
+normalize_wan_addrs() {
+    local iface="$1" count keep line addr
+    count=$(ip -4 -o addr show dev "$iface" | wc -l)
+    (( count > 1 )) || return 0
+    keep=$(ip route get 8.8.8.8 oif "$iface" 2>/dev/null \
+        | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
+    if [[ -z "$keep" ]]; then
+        log_fo "[$iface] WARNING: $count IPv4 addresses but no source for default route, not touching them"
+        return 0
+    fi
+    while IFS= read -r line; do
+        addr=$(awk '{print $4}' <<< "$line")
+        [[ "${addr%/*}" == "$keep" ]] && continue
+        ip -4 addr del "$addr" dev "$iface" 2>/dev/null \
+            && log_fo "[$iface] Removed stale address $addr (keeping $keep)"
+    done < <(ip -4 -o addr show dev "$iface")
+}
+
 ensure_iptables() {
     local lan_if
     lan_if=$(grep -E '^INTERFACESv4=' /etc/default/isc-dhcp-server 2>/dev/null | cut -d'"' -f2)
@@ -577,6 +609,7 @@ while true; do
             log_fo "[$iface] is suppressed, try ifup + TEST-Ping..."
             restore_interface "$iface" && restore_static_routes "$iface"
         else
+            normalize_wan_addrs "$iface"
             FAIL_FILE="$FAIL_DIR/fail-$iface.cnt"
             if ! check_wan "$iface"; then
                 n=$(( $(cat "$FAIL_FILE" 2>/dev/null || echo 0) + 1 ))
