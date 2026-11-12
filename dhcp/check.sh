@@ -361,9 +361,25 @@ restore_interface() {
     fi
 
     log_fo "RESTORE: Restart $iface via ifup..."
+    # A dhclient left over from an earlier, failed ifup blocks the next one.
+    # Clear it so each attempt starts clean.
+    pkill -f "dhclient.*$iface" 2>/dev/null || true
     ifup "$iface" 2>/dev/null \
         && log_fo "RESTORE: ifup $iface successfully" \
-        || log_fo "RESTORE: ifup $iface failed, try to test anyway"
+        || log_fo "RESTORE: ifup $iface failed, waiting for lease anyway"
+
+    # DHCP after a router restart can take well over 4s. Wait for a lease (max 45s)
+    # instead of a fixed sleep.
+    local waited=0
+    while (( waited < 45 )); do
+        ip -4 addr show dev "$iface" | grep -q "inet " && break
+        sleep 3
+        waited=$(( waited + 3 ))
+    done
+    if ! ip -4 addr show dev "$iface" | grep -q "inet "; then
+        log_fo "RESTORE: $iface got no lease after ${waited}s, trying dhclient once"
+        timeout 20 dhclient -1 "$iface" &>/dev/null || true
+    fi
 
     # ifup/dhclient installs its own default route (usually metric 0, i.e. better than the
     # active WAN). Remember its gateway, then drop the route at once: the WAN under test
@@ -377,9 +393,6 @@ restore_interface() {
         ip route del default via "$via" dev "$iface" ${mt:+metric $mt} 2>/dev/null && \
             log_fo "RESTORE: [$iface] removed ifup default route via $via ${mt:+metric $mt} (WAN under test)" || true
     done < <(ip route show default dev "$iface")
-
-    sleep 4
-
 
     local live_ip
     live_ip=$(ip -4 addr show dev "$iface" | awk '/inet/ {print $2}' | cut -d/ -f1 | head -n1)
