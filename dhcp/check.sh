@@ -578,6 +578,11 @@ ensure_iptables() {
 # ------------------------------------------------------------------
 log_fo "=== WAN Failover daemon started ==="
 touch "$STATE_FILE"
+# Fresh start: clear all failover state (suppressed WANs, cooldowns, stability and
+# failure counters). A new run of check.sh must not inherit the previous run's state.
+: > "$STATE_FILE"
+rm -f "$FAIL_DIR"/fail-*.cnt "$FAIL_DIR"/ok-*.cnt
+log_fo "State reset on daemon start"
 ensure_iptables
 
 DHCP_ROUTES_SCRIPT="/etc/1002xOPERATOR/dhcp/settings/dhcp-routes.sh"
