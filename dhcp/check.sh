@@ -414,6 +414,7 @@ restore_interface() {
 
     # Determine gateway (live_gw was captured right after ifup)
     local gw="${live_gw:-$saved_gw}"
+    [[ "$gw" == "0.0.0.0" ]] && gw=""
 
     if [[ -z "$gw" ]]; then
         log_fo "RESTORE: No Gateway for $iface, stays suppressed (no Route-ADD)"
@@ -614,6 +615,13 @@ while true; do
             log_fo "[$iface] is suppressed, try ifup + TEST-Ping..."
             restore_interface "$iface" && restore_static_routes "$iface"
         else
+            # IP but no default route (e.g. right after a daemon start): nothing to check
+            # against, so go straight to the restore path. No ifdown needed.
+            if ! ip route show default dev "$iface" | grep -q . && ip -4 -o addr show dev "$iface" | grep -q .; then
+                log_fo "[$iface] has IP but no default route, restoring directly (no ifdown)"
+                echo "SUPPRESSED $iface 0.0.0.0 100" >> "$STATE_FILE"
+                continue
+            fi
             normalize_wan_addrs "$iface"
             FAIL_FILE="$FAIL_DIR/fail-$iface.cnt"
             if ! check_wan "$iface"; then
