@@ -181,7 +181,6 @@ PING_COUNT=4
 PING_TIMEOUT=10
 
 
-FAIL_THRESHOLD=3      # consecutive failed checks before suppress
 LOSS_MAX=20          # max packet loss in % per target
 FAIL_DIR="/etc/1002xOPERATOR/dhcp/settings"
 
@@ -258,14 +257,15 @@ check_wan() {
     echo "$gw" > "$FAIL_DIR/gw-$iface"
     # Gateway ICMP is informational only (routers may deprioritise pings to themselves).
     # The WAN is judged by loss to the internet targets.
-    local ok=0 loss target
+    # 4 pings per target. Lost more than half of all pings -> WAN counts as down
+    # (route removed, interface stays up).
+    local ok=0 target rcv=0 sent=0 got
     for target in "${PING_TARGETS[@]}"; do
-        loss=$(ping -c "$PING_COUNT" -i 0.5 -W "$PING_TIMEOUT" -q -I "$iface" "$target" 2>/dev/null \
-            | grep -o '[0-9.]*% packet loss' | grep -o '^[0-9.]*')
-        loss=${loss:-100}; loss=${loss%.*}
-        if (( loss < LOSS_MAX )); then ok=1; break; fi
-        log_fo "[$iface] $target packet loss ${loss}% (max ${LOSS_MAX}%)"
+        got=$(ping -c 4 -i 0.25 -W 1 -I "$iface" "$target" 2>/dev/null | grep -o '[0-9]* received' | grep -o '^[0-9]*')
+        rcv=$(( rcv + ${got:-0} ))
+        sent=$(( sent + 4 ))
     done
+    (( (sent - rcv) * 2 <= sent )) && ok=1
     [[ "$ok" -eq 1 ]] || { log_fo "[$iface] No internet activity"; return 1; }
     return 0
 }
@@ -616,19 +616,10 @@ while true; do
                     continue
                 fi
             fi
-            FAIL_FILE="$FAIL_DIR/fail-$iface.cnt"
             if ! check_wan "$iface"; then
-                n=$(( $(cat "$FAIL_FILE" 2>/dev/null || echo 0) + 1 ))
-                echo "$n" > "$FAIL_FILE"
-                log_fo "[$iface] check failed ($n/$FAIL_THRESHOLD)"
-                if (( n >= FAIL_THRESHOLD )); then
-                    log_fo "$iface: $n consecutive failures, suppress routing (interface stays up)"
-                    suppress_interface "$iface"
-                    suspend_static_routes "$iface"
-                    rm -f "$FAIL_FILE"
-                fi
-            else
-                rm -f "$FAIL_FILE"
+                log_fo "$iface is DOWN or not reachable, suppress routing (interface stays up)"
+                suppress_interface "$iface"
+                suspend_static_routes "$iface"
             fi
         fi
     done
